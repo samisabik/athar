@@ -45,7 +45,6 @@ Search free online archives (Openverse, the Internet Archive, and Freesound with
 ## And also
 
 - **Projects** collect the sounds for a track or a kit in their own folder, as copies, so the library stays untouched.
-- **Export for the SP-404MKII** converts a whole project for the sampler in one step.
 - **Recorder** captures takes from your microphone or audio interface, ready to trim and save.
 - **Watched folders** pick up new files as you add them.
 - Reads WAV, AIFF, FLAC, MP3, OGG, M4A, AAC and WavPack.
