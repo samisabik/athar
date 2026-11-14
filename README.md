@@ -4,13 +4,13 @@
 
 # Athar
 
-Athar is a sound library for Mac. Point it at your sample folders, type what you want to hear, and it finds the sounds that match, whatever the files are called. Then edit them, layer them, and export a kit for your sampler.
+Athar is a sound library for Mac. Point it at your sample folders, type what you want to hear, and it finds the sounds that match. Then edit them, layer them, and export a kit for your sampler.
 
 Everything runs on your Mac. Your sounds stay on your disk and the search works offline.
 
 ## Find sounds by describing them
 
-Type "deep punchy kick drum", "rain on a window" or "warm pad" and Athar ranks your whole library by how close each sound is. It listens to the audio itself, so `REC_0042.wav` turns up as easily as a well-named file. Rate, tag and annotate sounds as you go.
+Type "deep punchy kick drum", "rain on a window" or "warm pad" and Athar ranks your whole library by how close each sound is. The search runs on CLAP (Contrastive Language-Audio Pretraining), an AI model trained on sounds paired with their descriptions. It has learned what a "punchy kick" or "rain" sounds like, so it compares your words with the audio itself. Rate, tag and annotate sounds as you go.
 
 ![Searching the library by description](docs/search.png)
 
