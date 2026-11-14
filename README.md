@@ -62,3 +62,7 @@ Athar runs on Apple silicon Macs with macOS 12 or later.
 ## From source
 
 Athar needs [uv](https://docs.astral.sh/uv/). `Build Athar.command` exports the search model and builds the app. `Athar.command` runs it from source once the model exists in `build/model`. `Test Athar.command` runs every automated check.
+
+## Licence
+
+Athar is released under the MIT licence, in `LICENSE`. The bundled fonts keep their own licences, in `athar/static/fonts/`.
