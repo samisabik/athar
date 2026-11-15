@@ -6,7 +6,7 @@ import { ArrBrowser } from './arrbrowser.js';
 
 // Sizes the stylesheet shares: the lane heads' width and a lane's height (style.css, "arranger").
 const HEAD_W = 168, LANE_H = 76;
-const MAGNET_PX = 9, WAVE_BINS = 400, WAVE_H = 24, LOOKAHEAD = 0.25, MAX_ZOOM = 32, NUDGE = 0.01;
+const DOUBLE_CLICK_MS = 400, MAGNET_PX = 9, WAVE_BINS = 400, WAVE_H = 24, LOOKAHEAD = 0.25, MAX_ZOOM = 32, NUDGE = 0.01;
 const TICKS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
 const empty = () => ({ loop: true, lanes: [] });
 const stem = (name) => name.replace(/\.[^.]+$/, '');
@@ -359,6 +359,11 @@ export class Arranger {
       }
       if (moved) this.save();
       this.render();
+      // Two clicks on the same clip, without moving it, open its sound in the editor.
+      if (moved) { this.lastClick = null; return; }
+      const now = performance.now(), again = this.lastClick?.clip === clip && now - this.lastClick.t < DOUBLE_CLICK_MS;
+      this.lastClick = again ? null : { clip, t: now };
+      if (again && !this.sounds.get(clip.path)?.error) this.h.edit(clip);
     };
     node.addEventListener('pointermove', move);
     for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) node.addEventListener(type, up);

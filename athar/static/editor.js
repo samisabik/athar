@@ -154,7 +154,7 @@ export class Editor {
         g.fillStyle = col('--accent'); g.globalAlpha = 0.1; g.fill(); g.globalAlpha = 1;
       }
       g.fillStyle = col('--accent');
-      for (const x of [fin.b > fin.a && this.sampleToX(fin.b), fout.b > fout.a && this.sampleToX(fout.a)]) if (x !== false && x >= -6 && x <= W + 6) g.fillRect(Math.round(x) - 5, Math.round(yOf(x)) - 5, 10, 10);
+      for (const x of [this.sampleToX(fin.b), this.sampleToX(fout.a)]) if (x >= -6 && x <= W + 6) g.fillRect(Math.round(x) - 5, Math.round(yOf(x)) - 5, 10, 10);
     }
     // Open on Trim silent ends, the parts it would cut are covered, with a line at each new edge.
     if (this.fx?.tab === 'tool' && this.fx.toolName === 'trimsilence') {

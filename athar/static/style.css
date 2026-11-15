@@ -632,10 +632,7 @@ body.indexing #toast { bottom: 92px; }
 .arr-body { flex: 1; min-height: 0; display: flex; gap: 18px; }
 .arb[hidden] { display: none; }
 .arb { flex: none; width: 300px; min-height: 0; display: flex; flex-direction: column; gap: 8px; }
-.arb-tabs { display: flex; border: 1.5px solid var(--ink); }
-.arb-tabs button { flex: 1; background: transparent; border: 0; color: var(--muted); justify-content: center; }
-.arb-tabs button.on { background: var(--ink); color: var(--raised); font-weight: 700; }
-.arb input, .arb select { width: 100%; }
+.arb select { width: 100%; }
 .arb-count { font-size: var(--fs-sm); }
 .arb-list { flex: 1; min-height: 0; overflow-y: auto; border-top: 1.5px solid var(--ink); }
 .arb-row { display: grid; grid-template-columns: 28px 56px minmax(0, 1fr) auto; padding-right: 6px; gap: 8px; align-items: center; min-height: 40px; border-bottom: 1px solid var(--line); cursor: grab; }
