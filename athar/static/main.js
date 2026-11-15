@@ -1518,7 +1518,7 @@ const SHORTCUTS = {
   editor: ['Editor', [['Space', 'Play or stop'], ['L', 'Loop on or off'], ['Cmd Z', 'Undo'], ['Shift Cmd Z', 'Redo'], ['Cmd A', 'Select all'], ['Cmd C, X, V', 'Copy, cut, paste'],
     ['Cmd T', 'Trim to the selection'], ['Backspace', 'Delete the selection'], ['+ and -', 'Zoom in and out'], ['F', 'Fit the whole sound'], ['E', 'Zoom to the selection'],
     ['R', 'Add a region from the selection'], ['B', 'Switch between Original and Edited'], ['Cmd S', 'Save as a new file'], ['Home, End', 'Cursor to start or end'], ['Escape', 'Clear the selection']]],
-  arranger: ['Arranger', [['Space', 'Play or stop'], ['L', 'Loop on or off'], ['B', 'Hide or show the browser'], ['Alt drag', 'Drag a copy of the clip'], ['Cmd drag', 'Move without catching on other clips'],
+  arranger: ['Arranger', [['Space', 'Play or stop'], ['L', 'Loop on or off'], ['B', 'Hide or show the browser'], ['Double-click', 'Edit the clip\'s sound'], ['Alt drag', 'Drag a copy of the clip'], ['Cmd drag', 'Move without catching on other clips'],
     ['Cmd C, X, V', 'Copy or cut the picked clip, paste it where playback starts'], ['D', 'Place the picked clip again, after itself'], ['← and →', 'Nudge the picked clip'], ['Backspace', 'Remove the picked clip'], ['M, S', 'Mute or solo its lane'],
     ['+ and -', 'Zoom in and out'], ['Home', 'Start from the beginning'], ['Escape', 'Stop playback']]],
   map: ['Map', [['Space', 'Play the picked sound'], ['+ and -', 'Zoom in and out'], ['Escape', 'Stop playback']]],
@@ -1636,6 +1636,7 @@ const arranger = new Arranger($('#arranger'), {
   preview: (it) => togglePreview(it),
   settings: () => SETTINGS,
   go: (view) => showView(view),
+  edit: (it) => openPath(it),
   stopOthers: () => { stopPreview(); discover.stop(); recorder.stopPlay(); if (editor.playing) editor.stopPlay(); editor.stopAudition(); },
   onSave: () => { refreshSide(); setTimeout(() => refreshSide(), 2500); },
 });
@@ -1727,7 +1728,7 @@ const CAT_TIPS = {
     'Save straight into a project to fill it as you record.',
   ],
   arranger: [
-    'The browser on the left is how sounds get here. Search the Library or pick a project, then drag a sound onto a lane.',
+    'The browser on the left is how sounds get here. Pick a project, then drag a sound onto a lane. Double-click a clip to edit its sound.',
     'A lane is a track you name: Drums, Vocal, Synth. Double-click its name to change it. Any sound can go in any lane.',
     'Drop a sound below the last lane and it starts a new lane. "Add a lane" makes an empty one to fill.',
     'Drag a clip sideways to move it in time, and up or down to move it to another lane. Hold alt to leave a copy behind.',

@@ -238,20 +238,26 @@ export class FxPanel {
     e.draw();
   }
 
+  // A section opens on the Original: nothing is worked out or heard until a control moves.
+  opened() {
+    const e = this.ed;
+    if (e.playing) e.play(true);
+    e.draw();
+  }
+
   async openTool(name) {
     if (this.tab === 'tool' && this.toolName === name && !this.root.hidden) return this.close();
     if (!await this.canLeave()) return;
     this.clearPreview(); this.clearView();
     this.ed.stopAudition();
-    this.bypass = false;
+    this.bypass = true;
     this.tab = 'tool'; this.toolName = name; this.root.hidden = false;
     if (name === 'trimsilence') this.ed.$('[data-f=trimthresh]').value = -96;
-    // Both fades start at a quarter of the sound, so each has a handle on the waveform to grab.
-    if (name === 'fade') { const q = Math.round(this.ed.rangeMs() / 4); this.ed.$('[data-f=fadeinlen]').value = q; this.ed.$('[data-f=fadeoutlen]').value = q; this.lastField = 0; }
+    if (name === 'fade') { this.ed.$('[data-f=fadeinlen]').value = 0; this.ed.$('[data-f=fadeoutlen]').value = 0; this.lastField = 0; }
     this.startValues = TOOLS[name].fields.map(f => this.ed.$(`[data-f=${f.f}]`).value);
     this.dress();
     this.build();
-    this.follow();
+    this.opened();
   }
 
   // Puts every control of the open section back to where it started.
@@ -267,7 +273,7 @@ export class FxPanel {
 
   // The parts of the sound the open Fade tool will change, for the editor to draw and to drag.
   toolMark() {
-    return this.tab === 'tool' && this.toolName === 'fade' && !this.bypass ? this.ed.fadeSpans() : null;
+    return this.tab === 'tool' && this.toolName === 'fade' && (!this.bypass || !this.touched) ? this.ed.fadeSpans() : null;
   }
 
   // The editor calls this when the selection or cursor moves.
@@ -285,12 +291,12 @@ export class FxPanel {
     if (this.tab === tab && !this.root.hidden) return this.close();
     if (!await this.canLeave()) return;
     this.clearPreview();
-    this.bypass = false;
+    this.bypass = true;
     this.ed.stopAudition();
     this.tab = tab; this.toolName = null; this.root.hidden = false;
     this.dress();
     this.build();
-    this.follow();
+    this.opened();
   }
 
   build() {
@@ -328,7 +334,14 @@ export class FxPanel {
     this.autoProf = null;
     this.noise = null;
     this.touched = false; this.wantPlay = false;
-    if (this.tab === 'nr' || this.tab === 'tool') this.build();
+    this.bypass = true; this.dressAb();
+    // Another sound starts every effect and tool from its initial settings. The tempo is the
+    // sound's own, set by the editor as it loads.
+    this.bands = []; this.selBand = -1;
+    for (const k in DEFAULTS) this[k] = { ...DEFAULTS[k] };
+    for (const t of Object.values(TOOLS)) for (const f of t.fields) if (f.f !== 'bpm') { const inp = this.ed.$(`[data-f=${f.f}]`); inp.value = inp.defaultValue; }
+    if (this.tab === 'tool') this.startValues = TOOLS[this.toolName].fields.map(f => this.ed.$(`[data-f=${f.f}]`).value);
+    if (this.tab) this.build();
     this.dressBar();
   }
 
@@ -750,7 +763,7 @@ export class FxPanel {
     const changed = () => {
       hint?.();
       // The value Tune sets by itself when it opens is not a change made by hand.
-      if (this.settingUp) { this.wantPlay = true; this.kickSoon(); } else this.touch();
+      if (!this.settingUp) this.touch();
       e.draw();
     };
     const rows = spec.fields.map((f, i) => {
