@@ -560,11 +560,16 @@ function padsArea(p, items, pads) {
     return focusable(c, () => it && togglePreview(it));
   };
   const used = new Set([...byPad.keys()].map(n => Math.floor(n / 16)));
-  const banks = el('div', { class: 'ab-switch', role: 'group', 'aria-label': 'Bank' },
-    [...BANKS].map((b, i) => el('button', {
-      class: (i === padBank ? 'on' : '') + (used.has(i) ? ' used' : ''), 'aria-pressed': String(i === padBank),
-      onclick: () => { padBank = i; renderProjectCard().catch(fail); },
-    }, b)));
+  // Five buttons like the sampler's: each holds a bank pair, and pressing the lit one again
+  // flips between its two banks. Another button keeps the current half.
+  const half = padBank >= 5 ? 5 : 0;
+  const letter = (i) => el('span', { class: used.has(i) ? 'used' : '' }, BANKS[i]);
+  const banks = el('div', { class: 'ab-switch banks', role: 'group', 'aria-label': 'Bank' },
+    [0, 1, 2, 3, 4].map((k) => el('button', {
+      class: padBank % 5 === k ? 'on' : '', 'aria-pressed': String(padBank % 5 === k),
+      'aria-label': `Bank ${BANKS[padBank % 5 === k ? padBank : k + half]}`,
+      onclick: () => { padBank = padBank % 5 === k ? (padBank + 5) % 10 : k + half; renderProjectCard().catch(fail); },
+    }, padBank % 5 === k ? BANKS[padBank] : [letter(k), '/', letter(k + 5)])));
   const grid = el('div', { class: 'padgrid' }, Array.from({ length: 16 }, (_, k) => cell(padBank * 16 + k)));
   const pool = el('div', {
     class: 'padpool',
