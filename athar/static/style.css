@@ -533,8 +533,10 @@ b, strong, h2, h3 { -webkit-text-stroke: .35px currentColor; }
 .prow-empty { padding: 12px 12px 12px 34px; border-bottom: 1px solid var(--line); font-size: var(--fs-sm); }
 .pads { flex-shrink: 0; }
 .padbar { display: flex; align-items: center; gap: 8px; padding: 14px 12px 10px 34px; }
-.padbar .ab-switch button { padding: 0 11px !important; }
-.padbar .ab-switch button.used:not(.on) { color: var(--ink); }
+.padbar .banks button { min-width: 50px; padding: 0 12px !important; justify-content: center; font-weight: 400; }
+.padbar .banks span { font-weight: 700; }
+.padbar .banks span.used { color: var(--ink); }
+.padbar .banks button.on { font-size: 1.12em; font-weight: 700; }
 .padgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; max-width: 760px; padding: 4px 12px 20px 34px; }
 .pad { height: 84px; background: var(--raised); border: 1px solid var(--line); padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; overflow: hidden; cursor: default; }
 .pad[draggable=true] { cursor: grab; }
