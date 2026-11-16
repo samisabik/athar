@@ -759,7 +759,8 @@ export class Editor {
         return this.editRegions(() => { this.regions.forEach(r => this.dropSelOf(r)); this.regions = []; });
       case 'exportregions': return this.exportRegions();
       case 'sp404':
-        return this.pickFolder('Choose the SD card (or any folder)').then(async (dir) => {
+        return fetch('/api/sp404-card').then(r => r.json()).catch(() => ({}))
+          .then(card => this.pickFolder('Choose the SD card (or any folder)', card.import || '')).then(async (dir) => {
           if (!dir) return;
           const blob = await this.render(this.channels, { mono: this.settings?.sp404_mono || this.settings?.export_mono, rate: 48000, bits: 16 });
           const res = await this.onSave(blob, dir, this.fileName(), { sp404: true });

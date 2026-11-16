@@ -31,6 +31,7 @@ BACKUPS_KEPT = 10
 EMB_DIM = 512
 SP404_SR = 48000
 SP404_MAX_SECONDS = 960
+SP404_PADS = 160
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS folders (path TEXT PRIMARY KEY);
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS catalog (
 CREATE TABLE IF NOT EXISTS regions (path TEXT PRIMARY KEY, data TEXT);
 CREATE TABLE IF NOT EXISTS projects (id INTEGER PRIMARY KEY, name TEXT UNIQUE, folder TEXT);
 CREATE TABLE IF NOT EXISTS project_items (
-    project_id INTEGER, path TEXT, added REAL, pos REAL, PRIMARY KEY (project_id, path)
+    project_id INTEGER, path TEXT, added REAL, pos REAL, pad INTEGER, PRIMARY KEY (project_id, path)
 );
 """
 
@@ -86,7 +87,7 @@ DEFAULT_SETTINGS = {
     "silence_db": -45,
     "slice_gap_ms": 250,
     "sp404_mono": False,
-    "name_pattern": "{project}_{category}_{n:03d}_{name}",
+    "name_pattern": "{project}_{name}",
     "projects_dir": "",
     "theme": "system",
     "freesound_key": "",
@@ -157,15 +158,38 @@ def ascii_name(s):
     return re.sub(r"[^A-Za-z0-9_\-]+", "_", s).strip("_") or "sample"
 
 
+def sp404_card(volumes="/Volumes"):
+    """A mounted SD card the SP-404MKII has formatted: it holds IMPORT and EXPORT at its root.
+    One named for the SP-404 wins when several cards are mounted."""
+    try:
+        cards = [e.path for e in os.scandir(volumes)
+                 if e.is_dir() and os.path.isdir(os.path.join(e.path, "IMPORT")) and os.path.isdir(os.path.join(e.path, "EXPORT"))]
+    except OSError:
+        return None
+    cards.sort(key=lambda p: "404" not in os.path.basename(p))
+    return cards[0] if cards else None
+
+
 def sp404_dir(dest):
     """The SP-404MKII imports from IMPORT at the SD card root; use it when present."""
     dest = Path(dest).expanduser()
+    if dest.name.upper() == "PROJECT" and dest.parent.name.upper() == "EXPORT":
+        dest = dest.parent.parent
+    elif dest.name.upper() == "EXPORT":
+        dest = dest.parent
     imp = dest / "IMPORT"
     return imp if imp.is_dir() else dest
 
 
 def to_sp404(src, target, mono=False):
     """48 kHz, 16-bit PCM WAV: the format the SP-404MKII imports from SD card."""
+    import soundfile as sf
+    sf.write(str(target), sp404_audio(src, mono).T, SP404_SR, subtype="PCM_16", format="WAV")
+
+
+def sp404_audio(src, mono=False):
+    """The sound as the SP-404MKII holds it: one or two channels at 48 kHz, ready to be cut
+    to 16 bits, shaped (channels, frames)."""
     import librosa
     import soundfile as sf
     y, sr = eng.read_any(str(src))
@@ -184,8 +208,7 @@ def to_sp404(src, target, mono=False):
         # TPDF dither, one 16-bit step peak to peak, so the word-length cut adds noise instead of distortion.
         rng = np.random.default_rng()
         y = y + (rng.random(y.shape, np.float32) - rng.random(y.shape, np.float32)) / 32768
-    y = np.clip(y, -1, 1)
-    sf.write(str(target), y.T, SP404_SR, subtype="PCM_16", format="WAV")
+    return np.clip(y, -1, 1)
 
 
 SAVE_FORMATS = {"wav": None, "flac": "FLAC", "mp3": "MP3"}
@@ -217,6 +240,7 @@ MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN folder TEXT;",
     "ALTER TABLE project_items ADD COLUMN pos REAL;",
     "ALTER TABLE catalog ADD COLUMN origin TEXT;",
+    "ALTER TABLE project_items ADD COLUMN pad INTEGER;",
 ]
 
 
@@ -366,7 +390,7 @@ class Library:
             data = {
                 "catalog": [dict(r) for r in self.q("SELECT path, tags, memo, rating, updated FROM catalog")],
                 "projects": [dict(r) for r in self.q("SELECT id, name FROM projects")],
-                "project_items": [dict(r) for r in self.q("SELECT project_id, path, added FROM project_items")],
+                "project_items": [dict(r) for r in self.q("SELECT project_id, path, added, pad FROM project_items")],
                 "folders": self.folders(),
                 "settings": self.settings(),
             }
@@ -634,6 +658,10 @@ class Library:
     def settings(self):
         row = self.q("SELECT value FROM meta WHERE key='settings'")
         saved = json.loads(row[0]["value"]) if row else {}
+        # Settings are saved whole, so a library from before the default changed holds the old
+        # default as if it had been chosen.
+        if saved.get("name_pattern") == "{project}_{category}_{n:03d}_{name}":
+            saved.pop("name_pattern")
         st = {**DEFAULT_SETTINGS, **{k: v for k, v in saved.items() if k in DEFAULT_SETTINGS}}
         st["projects_dir"] = st["projects_dir"] or default_projects_dir()
         return st
@@ -1103,7 +1131,7 @@ class Library:
     # ---- projects
     def projects(self):
         return [dict(r) for r in self.q(
-            "SELECT p.id, p.name, p.folder, COUNT(f.path) n FROM projects p "
+            "SELECT p.id, p.name, p.folder, COUNT(f.path) n, COALESCE(SUM(f.size), 0) bytes FROM projects p "
             "LEFT JOIN project_items i ON i.project_id=p.id "
             "LEFT JOIN files f ON f.path=i.path GROUP BY p.id ORDER BY p.name")]
 
@@ -1232,8 +1260,8 @@ class Library:
             new = self._into_project_folder(path, old)
             with self.tx() as db:
                 # The copy takes the original's place in the project, keeping its position.
-                db.execute("INSERT OR IGNORE INTO project_items(project_id, path, added, pos) "
-                           "SELECT project_id, ?, added, pos FROM project_items WHERE project_id=? AND path=?", (new, pid, old))
+                db.execute("INSERT OR IGNORE INTO project_items(project_id, path, added, pos, pad) "
+                           "SELECT project_id, ?, added, pos, pad FROM project_items WHERE project_id=? AND path=?", (new, pid, old))
                 db.execute("DELETE FROM project_items WHERE project_id=? AND path=?", (pid, old))
         return path
 
@@ -1318,7 +1346,8 @@ class Library:
         data = {
             "athar_backup": 1, "made": datetime.now().isoformat(timespec="seconds"),
             "catalog": [dict(r) for r in self.q("SELECT path, tags, memo, rating FROM catalog")],
-            "projects": [{"name": p["name"], "folder": p["folder"], "paths": self.project_order(p["id"])} for p in self.projects()],
+            "projects": [{"name": p["name"], "folder": p["folder"], "paths": self.project_order(p["id"]),
+                          "pads": self.project_pads(p["id"])} for p in self.projects()],
             "regions": [dict(r) for r in self.q("SELECT * FROM regions")],
         }
         target = unique_path(Path(dest) / f"Athar backup {datetime.now():%Y-%m-%d}.json")
@@ -1346,16 +1375,20 @@ class Library:
                 if r.get("path") and (tags or memo or rating):
                     sounds.append((str(r["path"]), json.dumps(tags), memo, rating))
             # The dated backups list project members apart from the projects, by project id.
-            members = {}
+            members, dated_pads = {}, {}
             for it in data.get("project_items") or []:
                 members.setdefault(it["project_id"], []).append((it.get("added") or 0, str(it["path"])))
+                if it.get("pad") is not None:
+                    dated_pads.setdefault(it["project_id"], {})[str(it["path"])] = it["pad"]
             projects = []
             for p in data.get("projects") or []:
                 name = str(p.get("name") or "").strip()
                 if not name:
                     continue
                 paths = [str(x) for x in p["paths"]] if "paths" in p else [x for _, x in sorted(members.get(p.get("id"), []))]
-                projects.append((name, p.get("folder") if isinstance(p.get("folder"), str) else None, paths))
+                pads = p["pads"] if isinstance(p.get("pads"), dict) else dated_pads.get(p.get("id"), {})
+                pads = {str(k): int(v) for k, v in pads.items() if v is not None and 0 <= int(v) < SP404_PADS}
+                projects.append((name, p.get("folder") if isinstance(p.get("folder"), str) else None, paths, pads))
             regions = [(str(r["path"]), r["data"] if isinstance(r["data"], str) else json.dumps(r["data"]))
                        for r in data.get("regions") or [] if r.get("path") and r.get("data")]
         except (AttributeError, KeyError, TypeError, ValueError) as e:
@@ -1368,12 +1401,16 @@ class Library:
             for path, blob in regions:
                 db.execute("INSERT OR REPLACE INTO regions VALUES (?, ?)", (path, blob))
             ids = []
-            for name, folder, paths in projects:
+            for name, folder, paths, pads in projects:
                 db.execute("INSERT OR IGNORE INTO projects(name) VALUES (?)", (name,))
                 pid = db.execute("SELECT id FROM projects WHERE name=?", (name,)).fetchone()[0]
                 for n, path in enumerate(paths):
                     db.execute("INSERT OR IGNORE INTO project_items(project_id, path, added) VALUES (?, ?, ?)", (pid, path, now))
                     db.execute("UPDATE project_items SET pos=? WHERE project_id=? AND path=?", (n, pid, path))
+                if pads:
+                    db.execute("UPDATE project_items SET pad=NULL WHERE project_id=?", (pid,))
+                    for path, pad in pads.items():
+                        db.execute("UPDATE project_items SET pad=? WHERE project_id=? AND path=?", (pad, pid, path))
                 ids.append((pid, folder))
             self._catalog_changed()
         for pid, folder in ids:
@@ -1385,6 +1422,26 @@ class Library:
                     pass
         return {"sounds": len(sounds), "projects": len(projects), "regions": len(regions)}
 
+    def project_pads(self, pid):
+        """Which SP-404MKII pad each sound sits on: 0 is A1, 16 is B1, 159 is J16."""
+        return {r["path"]: r["pad"] for r in self.q(
+            "SELECT path, pad FROM project_items WHERE project_id=? AND pad IS NOT NULL", (pid,))}
+
+    def set_project_pads(self, pid, pads):
+        """Replace the project's pad layout with pads, a map of path to pad number."""
+        pads = {str(k): int(v) for k, v in pads.items() if v is not None}
+        if any(not 0 <= v < SP404_PADS for v in pads.values()):
+            raise ValueError(f"Pads are numbered 0 to {SP404_PADS - 1}")
+        if len(set(pads.values())) != len(pads):
+            raise ValueError("Two sounds are on the same pad")
+        unknown = set(pads) - self.project_paths(pid)
+        if unknown:
+            raise ValueError(f"Not in this project: {sorted(unknown)[0]}")
+        with self.tx() as db:
+            db.execute("UPDATE project_items SET pad=NULL WHERE project_id=?", (pid,))
+            for path, pad in pads.items():
+                db.execute("UPDATE project_items SET pad=? WHERE project_id=? AND path=?", (pad, pid, path))
+
     def project_remove(self, pid, path):
         self.x("DELETE FROM project_items WHERE project_id=? AND path=?", (pid, path))
 
@@ -1392,11 +1449,12 @@ class Library:
         return {r["path"] for r in self.q(
             "SELECT path FROM project_items WHERE project_id=?", (pid,))}
 
-    def export_project(self, pid, dest, pattern="{project}_{category}_{n:03d}_{name}", fmt="copy"):
+    def export_project(self, pid, dest, pattern="{project}_{name}", fmt="copy"):
         check_pattern(pattern)
         name = self.q("SELECT name FROM projects WHERE id=?", (pid,))[0]["name"]
-        root = sp404_dir(dest) if fmt == "sp404" else Path(dest).expanduser()
-        dest = root if fmt == "sp404" else root / safe_name(name)
+        if fmt == "sp404":
+            return self.export_sp404_project(pid, name, dest)
+        dest = Path(dest).expanduser() / safe_name(name)
         dest.mkdir(parents=True, exist_ok=True)
         rows = {r["path"]: r for r in self.search(project=pid, sort="name", limit=100000)}
         written = []
@@ -1406,14 +1464,56 @@ class Library:
                 continue
             cat = rows.get(path, {}).get("category") or "Sound"
             base = pattern.format(project=safe_name(name), category=cat, n=n, name=src.stem)
-            if fmt == "sp404":
-                target = unique_path(dest / (ascii_name(base) + ".wav"))
-                to_sp404(src, target, mono=self.settings()["sp404_mono"])
-            else:
-                target = unique_path(dest / (safe_name(base) + src.suffix.lower()))
-                shutil.copy2(src, target)
+            target = unique_path(dest / (safe_name(base) + src.suffix.lower()))
+            shutil.copy2(src, target)
             written.append(str(target))
         return {"folder": str(dest), "files": written}
+
+
+    def sp404_layout(self, pid):
+        """Pad number to path: the pads as laid out, then the sounds without a pad on the free
+        pads in project order."""
+        order = [p for p in self.project_order(pid) if os.path.exists(p)]
+        pads = {n: p for p, n in self.project_pads(pid).items() if p in order}
+        rest = [p for p in order if p not in pads.values()]
+        free = [n for n in range(SP404_PADS) if n not in pads]
+        if len(rest) > len(free):
+            raise ValueError(f"{len(order)} sounds do not fit on the {SP404_PADS} pads of the SP-404MKII")
+        pads.update(zip(free, rest))
+        return dict(sorted(pads.items()))
+
+    def export_sp404_project(self, pid, name, dest):
+        """The project as an SP-404MKII project folder, named after the project, in IMPORT on
+        the SD card: IMPORT PROJECT on the device lists it there to copy into one of its 16
+        project slots."""
+        from . import sp404
+        layout = self.sp404_layout(pid)
+        if not layout:
+            raise ValueError("The project has no sounds to export")
+        folder = sp404_dir(dest) / ascii_name(name)
+        if folder.exists():
+            try:
+                theirs = sp404.read_padconf((folder / "PADCONF.BIN").read_bytes())[0]
+            except (OSError, ValueError):
+                theirs = None
+            if theirs != sp404.ascii_text(name, sp404.PROJECT_NAME_LEN):
+                raise ValueError(f"{folder.name} on the card holds another project")
+            shutil.rmtree(folder)
+        # The device's own exports, and the folder diagram in its manual, give every project
+        # folder PICTURE, PTN and SMPL. The project starts with no patterns.
+        for sub in ("SMPL", "PTN", "PICTURE"):
+            (folder / sub).mkdir(parents=True)
+        for pic in sp404.PICTURES:
+            (folder / "PICTURE" / f"{pic}.bmp").write_bytes(sp404.blank_picture())
+        rows = {r["path"]: r for r in self.search(project=pid, sort="name", limit=100000)}
+        mono, pads = self.settings()["sp404_mono"], {}
+        for n, path in layout.items():
+            data = sp404.smp_bytes(sp404_audio(path, mono))
+            (folder / "SMPL" / sp404.bank_file(n)).write_bytes(data)
+            r = rows.get(path, {})
+            pads[n] = (len(data), Path(path).stem, r.get("tempo") if r.get("is_loop") else None)
+        (folder / "PADCONF.BIN").write_bytes(sp404.padconf_bytes(name, pads))
+        return {"folder": str(folder), "files": [str(folder / "SMPL" / sp404.bank_file(n)) for n in layout]}
 
 
 def recorded_date(path):

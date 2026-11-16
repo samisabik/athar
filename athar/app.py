@@ -23,10 +23,10 @@ class Api:
 
     window = None
 
-    def pick_folder(self):
+    def pick_folder(self, directory=""):
         import webview
         kind = getattr(getattr(webview, "FileDialog", None), "FOLDER", None) or webview.FOLDER_DIALOG
-        res = self.window.create_file_dialog(kind)
+        res = self.window.create_file_dialog(kind, directory=directory or "")
         return res[0] if res else None
 
     def pick_file(self):

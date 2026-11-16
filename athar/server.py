@@ -16,7 +16,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import discover
 from . import engine as eng
-from .library import SAVE_FORMATS, Library, ascii_name, is_inside, safe_name, sp404_dir, to_sp404, transcode, unique_path
+from .library import SAVE_FORMATS, Library, ascii_name, is_inside, safe_name, sp404_card, sp404_dir, to_sp404, transcode, unique_path
 from . import __version__
 
 STATIC = Path(__file__).parent / "static"
@@ -116,6 +116,14 @@ def status():
     L = library()
     return {**L.status, "indexed": L.count(), "pending_jobs": L.jobs.qsize(),
             "device": L.engine.device if L.engine else None}
+
+
+@app.get("/api/sp404-card")
+def find_sp404_card():
+    card = sp404_card()
+    if not card:
+        return {"card": None}
+    return {"card": card, "import": os.path.join(card, "IMPORT")}
 
 
 @app.get("/api/settings")
@@ -375,6 +383,27 @@ def set_project_order(pid: int, req: OrderReq):
     return {"ok": True}
 
 
+class PadsReq(BaseModel):
+    pads: dict[str, int | None]
+
+
+@app.get("/api/projects/{pid}/pads")
+def project_pads(pid: int):
+    return library().project_pads(pid)
+
+
+@app.post("/api/projects/{pid}/pads")
+def set_project_pads(pid: int, req: PadsReq):
+    L = library()
+    if not L.project_exists(pid):
+        raise HTTPException(404, "Project not found")
+    try:
+        L.set_project_pads(pid, req.pads)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True}
+
+
 @app.post("/api/backup")
 def backup(req: PathReq):
     d = Path(req.path).expanduser()
@@ -396,7 +425,7 @@ def restore(req: PathReq):
 
 class ExportReq(BaseModel):
     dest: str
-    pattern: str = "{project}_{category}_{n:03d}_{name}"
+    pattern: str = "{project}_{name}"
     format: str = "copy"
 
 
