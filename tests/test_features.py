@@ -92,12 +92,38 @@ def test_export_follows_the_project_order(lib, add, tmp_path):
     assert [os.path.basename(f) for f in out["files"]] == ["001_b.wav", "002_a.wav"]
 
 
+def test_pads_hold_one_sound_each_and_follow_the_project(lib, add):
+    pid = lib.create_project("kit")["id"]
+    a, b = add("a.wav", seed=1, project=pid), add("b.wav", seed=2, project=pid)
+    lib.set_project_pads(pid, {a: 0, b: 17})
+    assert lib.project_pads(pid) == {a: 0, b: 17}
+    with pytest.raises(ValueError):
+        lib.set_project_pads(pid, {a: 3, b: 3})
+    with pytest.raises(ValueError):
+        lib.set_project_pads(pid, {a: 160})
+    with pytest.raises(ValueError):
+        lib.set_project_pads(pid, {"/not/in/the/project.wav": 1})
+    assert lib.project_pads(pid) == {a: 0, b: 17}
+    lib.set_project_pads(pid, {b: 5})
+    assert lib.project_pads(pid) == {b: 5}
+    lib.project_remove(pid, b)
+    assert lib.project_pads(pid) == {}
+
+
+def test_the_old_default_name_pattern_becomes_the_new_one(lib):
+    lib.update_settings({"name_pattern": "{project}_{category}_{n:03d}_{name}"})
+    assert lib.settings()["name_pattern"] == "{project}_{name}"
+    lib.update_settings({"name_pattern": "{n:03d}_{name}"})
+    assert lib.settings()["name_pattern"] == "{n:03d}_{name}"
+
+
 def test_backup_round_trip(lib, add, tmp_path):
     pid = lib.create_project("kit")["id"]
     a = add("a.wav", seed=1, tags=["keep"], rating=4, project=pid)
     b = add("b.wav", seed=2, project=pid)
     lib.catalog_set(a, {"memo": "under the bridge"})
     lib.set_project_order(pid, [b, a])
+    lib.set_project_pads(pid, {a: 16})
     file = lib.export_backup(str(tmp_path))
     assert json.load(open(file))["athar_backup"] == 1
     lib.catalog_set(a, {"tags": [], "rating": 0, "memo": ""})
@@ -106,6 +132,7 @@ def test_backup_round_trip(lib, add, tmp_path):
     c = lib.catalog_get(a)
     assert (c["tags"], c["rating"], c["memo"]) == (["keep"], 4, "under the bridge")
     assert lib.project_order(lib.projects()[0]["id"]) == [b, a]
+    assert lib.project_pads(lib.projects()[0]["id"]) == {a: 16}
 
 
 def test_restore_refuses_a_file_that_is_not_a_backup(lib, tmp_path):
@@ -170,9 +197,10 @@ def test_restore_reads_the_dated_backups_too(lib, add, tmp_path):
     pid = lib.create_project("kit")["id"]
     a = add("a.wav", seed=1, tags=["keep"], project=pid)
     b = add("b.wav", seed=2, project=pid)
+    lib.set_project_pads(pid, {b: 2})
     dated = {"catalog": [dict(r) for r in lib.q("SELECT path, tags, memo, rating, updated FROM catalog")],
              "projects": [{"id": pid, "name": "kit"}],
-             "project_items": [dict(r) for r in lib.q("SELECT project_id, path, added FROM project_items")]}
+             "project_items": [dict(r) for r in lib.q("SELECT project_id, path, added, pad FROM project_items")]}
     file = tmp_path / "catalog-2026-11-13.json"
     file.write_text(json.dumps(dated))
     lib.delete_project(pid)
@@ -180,6 +208,7 @@ def test_restore_reads_the_dated_backups_too(lib, add, tmp_path):
     assert lib.restore_backup(str(file))["projects"] == 1
     assert lib.catalog_get(a)["tags"] == ["keep"]
     assert lib.project_paths(lib.projects()[0]["id"]) == {a, b}
+    assert lib.project_pads(lib.projects()[0]["id"]) == {b: 2}
 
 
 def test_a_damaged_backup_restores_nothing(lib, add, tmp_path):

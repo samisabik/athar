@@ -291,6 +291,7 @@ main { position: relative; grid-column: 2; grid-row: 1; display: flex; flex-dire
 #modal { position: fixed; inset: 0; background: rgba(44, 48, 51, .16); display: grid; place-items: center; z-index: 30; }
 .modal-card { background: var(--raised); border: 2px solid var(--rule); border-radius: 0; padding: 20px; width: min(480px, 92vw); display: flex; flex-direction: column; gap: 12px; box-shadow: 0 10px 40px rgba(0,0,0,.08); }
 .modal-card label { display: flex; flex-direction: column; align-items: stretch; gap: 4px; }
+.modal-card label[hidden] { display: none; }
 .row { display: flex; gap: 8px; align-items: center; }
 .row.end { justify-content: flex-end; }
 #toast {
@@ -528,9 +529,29 @@ b, strong, h2, h3 { -webkit-text-stroke: .35px currentColor; }
 .item.sub .i { color: var(--muted); }
 .projbar { display: inline-flex; align-items: center; gap: 2px; }
 .projfacts { font-size: var(--fs-sm); white-space: nowrap; }
-#projList .item > .i { color: var(--muted); }
 #projList .prow { padding-left: 34px; min-height: 44px; flex-shrink: 0; }
-.prow-empty { padding: 12px 12px 12px 46px; border-bottom: 1px solid var(--line); font-size: var(--fs-sm); }
+.prow-empty { padding: 12px 12px 12px 34px; border-bottom: 1px solid var(--line); font-size: var(--fs-sm); }
+.pads { flex-shrink: 0; }
+.padbar { display: flex; align-items: center; gap: 8px; padding: 14px 12px 10px 34px; }
+.padbar .ab-switch button { padding: 0 11px !important; }
+.padbar .ab-switch button.used:not(.on) { color: var(--ink); }
+.padgrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; max-width: 760px; padding: 4px 12px 20px 34px; }
+.pad { height: 84px; background: var(--raised); border: 1px solid var(--line); padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; overflow: hidden; cursor: default; }
+.pad[draggable=true] { cursor: grab; }
+.pad:hover { background: var(--hover); }
+.pad.empty { background: transparent; }
+.pad.over { background: var(--hover); border-color: var(--ink); }
+.pad:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.pad .pn { color: var(--muted); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; }
+.pad .qn { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pad .mini { margin-top: auto; height: 18px; }
+.pad.playing .qn { color: var(--accent-text); }
+.pad { position: relative; }
+.pad .padx { position: absolute; top: 2px; right: 2px; width: 28px; height: 28px; opacity: 0; }
+.pad .padx .i { font-size: 18px; }
+.pad:hover .padx, .pad:focus-within .padx { opacity: 1; }
+.padghost { position: fixed; top: -1000px; left: 0; }
+.padpool { border-top: 1px solid var(--line); min-height: 12px; }
 
 /* ---------- discover: free online archives */
 .disc-top { padding: 4px 28px 4px; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; transition: padding-top .22s ease; }

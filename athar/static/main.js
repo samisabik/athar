@@ -136,6 +136,9 @@ function modal(title, fields) {
     return s;
   });
   const rows = fields.map((f, k) => el('label', {}, f.label, inputs[k]));
+  // A field with `when` shows only while the values of the fields pass it.
+  const sync = () => { const vals = inputs.map(i => i.value); fields.forEach((f, k) => { if (f.when) rows[k].hidden = !f.when(...vals); }); };
+  inputs.forEach(i => i.addEventListener('change', sync)); sync();
   return dialog(title, rows, inputs[0], 'OK', () => inputs.map(i => i.value.trim()));
 }
 
@@ -165,8 +168,8 @@ async function trashSound(it) {
   } catch (e) { fail(e); }
 }
 
-async function pickFolder(title = 'Choose a folder') {
-  if (window.pywebview?.api?.pick_folder) return window.pywebview.api.pick_folder();
+async function pickFolder(title = 'Choose a folder', start = '') {
+  if (window.pywebview?.api?.pick_folder) return window.pywebview.api.pick_folder(start);
   const v = await modal(title, [{ label: 'Folder path', placeholder: '/Users/you/Samples' }]);
   return v && v[0];
 }
@@ -395,7 +398,7 @@ async function loadCats() {
   sel.value = state.category || '';
 }
 
-let projSel = null, projSeq = 0;
+let projSel = null, projShut = false, projSeq = 0;
 async function loadProjects() {
   state.projects = await api('/api/projects');
   if (!state.projects.some(p => p.id === projSel)) projSel = state.projects[0]?.id ?? null;
@@ -410,12 +413,13 @@ async function renderProjectCard() {
     box.replaceChildren(el('div', { class: 'empty' }, el('h3', {}, 'No projects yet'), el('p', { class: 'muted' }, 'A project is a folder of its own for what you are making. Create one, then add sounds from the Library: each is copied in, and the original stays where it is.')));
     return;
   }
-  const p = state.projects.find(x => x.id === projSel);
+  const p = projShut ? null : state.projects.find(x => x.id === projSel);
   let items = p?.n ? await api('/api/search', { json: { project: p.id, sort: 'name', limit: 5000 } }) : [];
   if (items.length > 1) {
     const order = await api(`/api/projects/${p.id}/order`), at = new Map(order.map((path, k) => [path, k]));
     items.sort((a, b) => (at.get(a.path) ?? 1e9) - (at.get(b.path) ?? 1e9));
   }
+  const pads = padView && items.length ? await api(`/api/projects/${p.id}/pads`) : {};
   if (seq !== projSeq) return;
   const count = (n) => `${n} sound${n === 1 ? '' : 's'}`;
   const rename = async () => {
@@ -426,14 +430,18 @@ async function renderProjectCard() {
   };
   const stop = (fn) => (e) => { e?.stopPropagation(); return fn(); };
   const actions = () => [
-    ib('ios_share', 'Export: copy the files, or convert them for the SP-404MKII', stop(() => exportProject(p))),
-    ib('queue_music', 'Show these sounds in the Library', stop(() => { state.project = p.id; showView('sounds'); search(); })),
+    ib('ios_share', 'Export: copy the files, or make an SP-404MKII project', stop(() => exportProject(p))),
+    ib('grid_view', 'Pads: lay the sounds out on the SP-404MKII pads', stop(() => {
+      padView = !padView;
+      try { localStorage.setItem('athar.padView', padView ? '1' : ''); } catch { }
+      renderProjectCard().catch(fail);
+    }), padView ? 'on' : ''),
     ib('dynamic_feed', 'Batch: prep or convert every sound in this project', stop(() => batch(items))),
-    ib('folder', p.folder ? `Project folder: ${p.folder}. Sounds you add are copied into it. Click to move the project to another folder` : 'Choose the folder this project keeps its sounds in', stop(() => chooseProjectFolder(p))),
-    p.folder ? ib('folder_open', 'Show the project folder in Finder', stop(() => revealFolder(p.folder))) : null,
     ib('edit', 'Rename project', stop(rename)),
-    ib('delete', 'Delete project (its folder and files stay on disk)', stop(async () => {
-      if (!await confirmModal(`Delete ${p.name}?`, 'The project is removed from Athar. Its folder and the files in it stay on disk, and the originals in the Library are untouched.', 'Delete')) return;
+    ib('queue_music', 'Show its sounds in the Library', stop(() => { state.project = p.id; showView('sounds'); search(); })),
+    p.folder ? ib('folder_open', 'Show in Finder', stop(() => revealFolder(p.folder))) : null,
+    ib('close', 'Remove from Athar. The files stay on disk', stop(async () => {
+      if (!await confirmModal(`Remove ${p.name}?`, 'The project leaves Athar. Its folder and files stay on disk.', 'Remove')) return;
       try { await api(`/api/projects/${p.id}`, { method: 'DELETE' }); }
       catch (e) { return fail(e); }
       if (state.project === p.id) { state.project = null; search(); }
@@ -442,13 +450,13 @@ async function renderProjectCard() {
   ];
   const out = [];
   for (const x of state.projects) {
-    const on = x.id === projSel, pick = () => { if (!on) { projSel = x.id; renderProjectCard().catch(fail); } };
+    const on = !projShut && x.id === projSel, pick = () => { projShut = on; projSel = x.id; renderProjectCard().catch(fail); };
     out.push(focusable(el('div', { class: 'item' + (on ? ' on' : ''), onclick: pick },
-      icon(on ? 'expand_more' : 'chevron_right'),
       el('span', { class: 'label' }, x.name),
-      el('span', { class: 'count' }, count(on ? items.length : x.n || 0)),
+      el('span', { class: 'count' }, [count(on ? items.length : x.n || 0), diskSize(x.bytes)].filter(Boolean).join(', ')),
       on ? actions() : null), pick));
     if (!on) continue;
+    if (padView && items.length) { out.push(padsArea(p, items, pads)); continue; }
     out.push(...(items.length ? items.map(it => projectRow(p, it, items))
       : [el('div', { class: 'prow-empty muted' }, 'No sounds yet. Add some from the Library with "Add to project". Each one is copied into this project.')]));
   }
@@ -467,7 +475,7 @@ async function chooseProjectFolder(p) {
 }
 
 // Rows of a project can be dragged into the order the pads should have.
-let dragPath = null;
+let dragPath = null, dragPad = null;
 async function moveInProject(p, items, from, to, after) {
   const paths = items.map(x => x.path).filter(x => x !== from);
   paths.splice(paths.indexOf(to) + (after ? 1 : 0), 0, from);
@@ -479,9 +487,9 @@ function projectRow(p, it, items = []) {
   return focusable(el('div', { class: 'prow', draggable: 'true', ondblclick: () => openPath(it), 'data-tip': 'Double-click to edit. Drag to reorder.',
     ondragstart: (e) => { dragPath = it.path; e.dataTransfer?.setData('text/plain', it.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'; },
     ondragend: () => { dragPath = null; document.querySelectorAll('.prow.drop-before, .prow.drop-after').forEach(n => n.classList.remove('drop-before', 'drop-after')); },
-    ondragover: (e) => { if (!dragPath || dragPath === it.path) return; e.preventDefault(); const a = over(e); e.currentTarget.classList.toggle('drop-after', a); e.currentTarget.classList.toggle('drop-before', !a); },
+    ondragover: (e) => { if (!dragPath || dragPath === it.path || dragPad != null) return; e.preventDefault(); const a = over(e); e.currentTarget.classList.toggle('drop-after', a); e.currentTarget.classList.toggle('drop-before', !a); },
     ondragleave: (e) => e.currentTarget.classList.remove('drop-before', 'drop-after'),
-    ondrop: (e) => { if (!dragPath || dragPath === it.path) return; e.preventDefault(); e.stopPropagation(); const from = dragPath; dragPath = null; moveInProject(p, items, from, it.path, over(e)); } },
+    ondrop: (e) => { if (!dragPath || dragPath === it.path || dragPad != null) return; e.preventDefault(); e.stopPropagation(); const from = dragPath; dragPath = null; moveInProject(p, items, from, it.path, over(e)); } },
     Object.assign(ib(isPlaying(it) ? 'stop' : 'play_arrow', isPlaying(it) ? 'Stop' : 'Play', (e) => { e.stopPropagation(); togglePreview(it); }, 'pplay'), { playPath: it.path }),
     miniWave(it),
     el('span', { class: 'qn' }, it.name),
@@ -494,16 +502,110 @@ function projectRow(p, it, items = []) {
     })), () => openPath(it));
 }
 
+// The SP-404MKII has ten banks of sixteen pads. Pad n is bank n / 16, pad n % 16, and a
+// bank's pads read like text: 1 to 4 across the top row, 13 to 16 across the bottom.
+const BANKS = 'ABCDEFGHIJ', PADS = 160;
+let padView = false, padBank = 0;
+try { padView = localStorage.getItem('athar.padView') === '1'; } catch { }
+const padName = (n) => `${BANKS[Math.floor(n / 16)]}${n % 16 + 1}`;
+
+function padsArea(p, items, pads) {
+  const byPath = new Map(items.map(it => [it.path, it]));
+  pads = Object.fromEntries(Object.entries(pads).filter(([path]) => byPath.has(path)));
+  const byPad = new Map(Object.entries(pads).map(([path, n]) => [n, byPath.get(path)]));
+  const save = async (next) => {
+    try { await api(`/api/projects/${p.id}/pads`, { json: { pads: next } }); } catch (e) { return fail(e); }
+    renderProjectCard().catch(fail);
+  };
+  const place = (path, n) => {
+    const next = { ...pads }, from = next[path], there = byPad.get(n);
+    if (there && there.path !== path) { if (from != null) next[there.path] = from; else delete next[there.path]; }
+    next[path] = n;
+    save(next);
+  };
+  const fill = () => {
+    const next = { ...pads }, taken = new Set(byPad.keys());
+    let n = padBank * 16, left = 0;
+    for (const it of items) {
+      if (it.path in next) continue;
+      while (n < PADS && taken.has(n)) n++;
+      if (n >= PADS) { left++; continue; }
+      next[it.path] = n; taken.add(n);
+    }
+    if (left) notice(`${left} sound${left === 1 ? '' : 's'} did not fit: the pads from ${BANKS[padBank]}1 to J16 are full`);
+    save(next);
+  };
+  const clear = (path) => { const next = { ...pads }; delete next[path]; save(next); };
+  const endDrag = () => { dragPath = null; dragPad = null; document.querySelectorAll('.pad.over').forEach(x => x.classList.remove('over')); };
+  const cell = (n) => {
+    const it = byPad.get(n);
+    const c = el('div', {
+      class: 'pad' + (it ? '' : ' empty') + (isPlaying(it) ? ' playing' : ''), draggable: it ? 'true' : 'false',
+      onclick: () => { if (it) togglePreview(it); },
+      ondblclick: () => { if (it) openPath(it); },
+      ondragstart: (e) => { dragPath = it.path; dragPad = n; e.dataTransfer?.setData('text/plain', it.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'; },
+      ondragend: endDrag,
+      ondragover: (e) => { if (!dragPath) return; e.preventDefault(); e.currentTarget.classList.add('over'); },
+      ondragleave: (e) => e.currentTarget.classList.remove('over'),
+      ondrop: (e) => { if (!dragPath) return; e.preventDefault(); e.stopPropagation(); const path = dragPath; endDrag(); place(path, n); },
+    },
+      el('span', { class: 'pn' }, padName(n)),
+      it ? el('span', { class: 'qn' }, it.name.replace(/\.[^.]+$/, '')) : null,
+      it ? miniWave(it) : null,
+      it ? ib('close', 'Clear pad', (e) => { e.stopPropagation(); clear(it.path); }, 'padx') : null);
+    if (it) {
+      c.padPath = it.path;
+      c.addEventListener('keydown', (e) => { if (e.target === c && (e.key === 'Delete' || e.key === 'Backspace')) { e.preventDefault(); clear(it.path); } });
+    }
+    return focusable(c, () => it && togglePreview(it));
+  };
+  const used = new Set([...byPad.keys()].map(n => Math.floor(n / 16)));
+  const banks = el('div', { class: 'ab-switch', role: 'group', 'aria-label': 'Bank' },
+    [...BANKS].map((b, i) => el('button', {
+      class: (i === padBank ? 'on' : '') + (used.has(i) ? ' used' : ''), 'aria-pressed': String(i === padBank),
+      onclick: () => { padBank = i; renderProjectCard().catch(fail); },
+    }, b)));
+  const grid = el('div', { class: 'padgrid' }, Array.from({ length: 16 }, (_, k) => cell(padBank * 16 + k)));
+  const pool = el('div', {
+    class: 'padpool',
+    ondragover: (e) => { if (dragPad != null) e.preventDefault(); },
+    ondrop: (e) => {
+      if (dragPad == null) return;
+      e.preventDefault();
+      const path = dragPath; endDrag(); clear(path);
+    },
+  }, items.filter(it => !(it.path in pads)).map(it => {
+    const row = projectRow(p, it, items);
+    // Dragged toward the grid, the row looks like the pad it is about to become.
+    row.addEventListener('dragstart', (e) => {
+      if (!e.dataTransfer?.setDragImage) return;
+      const w = grid.querySelector('.pad')?.offsetWidth || 180;
+      const ghost = el('div', { class: 'pad padghost', style: `width:${w}px` },
+        el('span', { class: 'pn' }, '\u00a0'), el('span', { class: 'qn' }, it.name.replace(/\.[^.]+$/, '')), miniWave(it));
+      document.body.append(ghost);
+      e.dataTransfer.setDragImage(ghost, w / 2, 42);
+      setTimeout(() => ghost.remove(), 0);
+    });
+    return row;
+  }));
+  return el('div', { class: 'pads' },
+    el('div', { class: 'padbar' }, banks, ib('auto_awesome_mosaic', 'Fill the free pads in project order', fill)),
+    grid, pool);
+}
+
 async function exportProject(p) {
   const v = await modal(`Export ${p.name}`, [
-    { label: 'Format', options: [['copy', 'Copy original files'], ['sp404', 'SP-404MKII (48 kHz 16-bit WAV, into IMPORT on the SD card)']] },
-    { label: 'Name pattern: {project} {category} {n:03d} {name}', value: SETTINGS.name_pattern || '{project}_{category}_{n:03d}_{name}' },
+    { label: 'Format', options: [['copy', 'Copy original files'], ['sp404', 'SP-404MKII project']] },
+    { label: 'Name pattern: {project} {category} {n:03d} {name}', value: SETTINGS.name_pattern || '{project}_{name}', when: (f) => f !== 'sp404' },
   ]);
   if (!v) return;
-  const dest = await pickFolder(v[0] === 'sp404' ? 'Choose the SD card' : 'Export to folder');
+  const card = v[0] === 'sp404' ? await api('/api/sp404-card').catch(() => ({})) : {};
+  const dest = await pickFolder(v[0] === 'sp404' ? 'Choose the SD card' : 'Export to folder', card.import || '');
   if (!dest) return;
-  try { await api(`/api/projects/${p.id}/export`, { json: { dest, pattern: v[1], format: v[0] } }); }
-  catch (e) { fail(e); }
+  try {
+    const r = await api(`/api/projects/${p.id}/export`, { json: { dest, pattern: v[1], format: v[0] } });
+    if (v[0] === 'sp404') notice(`Saved ${r.folder.split('/').pop()}`);
+  } catch (e) { fail(e); }
 }
 
 // ---------- batch: prep or convert many sounds, each saved as a new file
@@ -879,6 +981,7 @@ function markPlaying() {
   $('#results').querySelectorAll('.qitem[data-i]').forEach((r) => {
     r.classList.toggle('playing', isPlaying(state.items[r.dataset.i]));
   });
+  document.querySelectorAll('.pad').forEach((c) => c.classList.toggle('playing', !!c.padPath && playingItem?.path === c.padPath));
   // The play buttons of a project's sounds show stop while their sound plays.
   document.querySelectorAll('.pplay').forEach((b) => {
     const on = playingItem?.path === b.playPath, tip = on ? 'Stop' : 'Play';
@@ -1021,10 +1124,10 @@ $('#projectOk').onclick = async () => {
   try {
     const p = await api('/api/projects', { json: { name } });
     $('#projectInput').value = ''; projectForm(false);
-    projSel = p.id;
+    projSel = p.id; projShut = false;
     await loadProjects();
     if (p.folder) notice(`${p.name} keeps its sounds in ${p.folder}`, 6000);
-    else if (p.folder_error) notice(`${p.name} has no folder yet: ${p.folder_error}. Use the folder button on its row.`, 8000);
+    else if (p.folder_error) notice(`${p.name} has no folder yet: ${p.folder_error}`, 8000);
     refreshSide();
   } catch (e) { fail(e); }
 };
@@ -1746,7 +1849,7 @@ const CAT_TIPS = {
   ],
   projects: [
     'A project has its own folder. "Add to project" on a sound copies it in.',
-    'Export converts the whole project for the SP-404MKII: 48 kHz, 16-bit, straight into IMPORT.',
+    'Export makes an SP-404MKII project with the pads as laid out, ready for IMPORT PROJECT on the device.',
     'Double-click a sound in a project to open it in the editor.',
     'A sound can be added to several projects. Each gets its own copy, and the original stays in the Library.',
     'Exported files are named by the pattern in Settings, so they sort neatly on the sampler.',
