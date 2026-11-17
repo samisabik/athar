@@ -21,6 +21,8 @@ listen('engine', (/** @type {{ now: number, rate: number, ended: number[] }} */ 
   base = { t: s.now, at: performance.now() }; rate = s.rate || rate;
   for (const id of s.ended) { const f = waiting.get(id); waiting.delete(id); f?.(); }
 });
+// A page that starts fresh, after a launch or a reload, starts in silence.
+invoke('audio_reset').catch(() => { });
 invoke('audio_info').then((s) => { base = { t: s.now, at: performance.now() }; rate = s.rate || rate; }).catch(() => { });
 
 /** The engine's clock in seconds, counted on from its last report; it never runs backwards. */

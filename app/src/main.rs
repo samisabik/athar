@@ -523,6 +523,16 @@ fn audio_watch_spectrum(watch: State<events::Watch>, on: bool) {
     watch.spectrum.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The page has just loaded, after a start or a reload: whatever a page before it left playing
+/// or recording stops, since nothing could stop it any more.
+#[tauri::command(async)]
+fn audio_reset(audio: Audio, ed: Ed, arr: ArrS, rec: State<input::Input>) {
+    ed.stop();
+    arr.stop();
+    rec.stop();
+    audio.stop_all();
+}
+
 #[tauri::command(async)]
 fn audio_volume(audio: Audio, v: f32) {
     audio.set_volume(v);
@@ -862,7 +872,7 @@ fn main() {
             rename_project, delete_project, project_item, project_folder, project_order, set_project_order, project_pads,
             set_project_pads, arrangement, set_arrangement, discover_sources, not_yet,
             pick_folder, pick_file, debug_log, set_dirty, quit_now, export_project, backup, restore, discover_search,
-            discover_waveform, discover_files, discover_save, discover_preview, audio_info, audio_poll, audio_preview, audio_start, rec_devices, rec_start, rec_stop, rec_discard, ed_open, ed_saved, ed_regions, ed_edit, ed_undo, ed_view, ed_noise, ed_analyse, ed_peaks, ed_spec, ed_play, ed_stop, ed_eq, eq_response, fx_curve, map_names, audio_volume, audio_watch_spectrum, ed_save, ed_download, rec_save, batch_save, arr_load, arr_keep, arr_play, arr_set, arr_stop, arr_save,
+            discover_waveform, discover_files, discover_save, discover_preview, audio_info, audio_poll, audio_preview, audio_start, rec_devices, rec_start, rec_stop, rec_discard, ed_open, ed_saved, ed_regions, ed_edit, ed_undo, ed_view, ed_noise, ed_analyse, ed_peaks, ed_spec, ed_play, ed_stop, ed_eq, eq_response, fx_curve, map_names, audio_volume, audio_reset, audio_watch_spectrum, ed_save, ed_download, rec_save, batch_save, arr_load, arr_keep, arr_play, arr_set, arr_stop, arr_save,
             audio_stop
         ])
         .setup(|app| {

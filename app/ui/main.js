@@ -409,6 +409,12 @@ $('#projectInput').onkeydown = (/** @type {KeyboardEvent} */ e) => { if (e.key =
 
 window.addEventListener('dragover', (e) => e.preventDefault());
 window.addEventListener('drop', (e) => e.preventDefault());
+// The web view's own right-click menu (Reload, Inspect) does not belong in the app; text
+// fields keep theirs, for copy and paste.
+document.addEventListener('contextmenu', (e) => {
+  const t = /** @type {HTMLElement} */ (e.target);
+  if (!t.closest?.('input, textarea, [contenteditable="true"]')) e.preventDefault();
+});
 // Folders dropped from Finder are added natively; this says what happened.
 listen('dropped', ({ added, problems }) => {
   if (added.length) { refreshSide(); notice(`Added ${added.join(', ')} to your library`); }

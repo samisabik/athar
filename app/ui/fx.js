@@ -149,6 +149,8 @@ export class FxPanel {
     });
     this.toolTabs = /** @type {HTMLElement} */ (root.querySelector('[data-x=tooltabs]'));
     this.toolTabs.addEventListener('click', (e) => {
+      const act = /** @type {HTMLElement | null} */ (/** @type {Element} */ (e.target).closest('[data-act]'));
+      if (act) return void this.ed.action(/** @type {string} */ (act.dataset.act));
       const b = /** @type {Element} */ (e.target).closest('[data-tool]'); if (b && b.dataset.tool !== this.toolName) this.openTool(/** @type {string} */ (b.dataset.tool));
     });
     /** @type {Element} */ (root.querySelector('[data-x=ab]')).addEventListener('click', (e) => {
@@ -188,12 +190,14 @@ export class FxPanel {
   // The tools that share a menu (or the slicer row) with the open one, as icon tabs.
   dressToolTabs() {
     const item = document.querySelector(`#editor .tmenu-list [data-a=${this.toolName}], #editor .regions-row [data-a=${this.toolName}]`);
-    const group = item ? [.../** @type {HTMLElement} */ (item.parentElement).querySelectorAll('[data-a]')].filter(b => toolSpec(b.dataset.a)) : [];
+    // Reverse has no settings, so its tab runs it at once.
+    const group = item ? [.../** @type {HTMLElement} */ (item.parentElement).querySelectorAll('[data-a]')].filter(b => toolSpec(b.dataset.a) || b.dataset.a === 'reverse') : [];
     this.toolTabs.hidden = group.length < 2;
     this.toolTabs.replaceChildren(...group.map((b) => {
-      const name = b.dataset.a, t = document.createElement('button');
+      const name = /** @type {string} */ (b.dataset.a), t = document.createElement('button'), title = toolSpec(name)?.title || 'Reverse';
       t.type = 'button'; t.className = 'ib' + (name === this.toolName ? ' on' : '');
-      t.dataset.tool = name; t.dataset.tip = toolSpec(name).title; t.setAttribute('aria-label', toolSpec(name).title);
+      if (toolSpec(name)) t.dataset.tool = name; else t.dataset.act = name;
+      t.dataset.tip = title; t.setAttribute('aria-label', title);
       t.innerHTML = `<span class="i">${/** @type {Element} */ (b.querySelector('.i')).textContent}</span>`;
       return t;
     }));
@@ -242,7 +246,8 @@ export class FxPanel {
       // A tool is heard as a short excerpt around what it changes, unless the loop is on.
       if (!(e.loop && SAME_LENGTH.has(name) && !this.long())) { done(); return void e.audition(/** @type {string} */ (name)); }
     }
-    if (tab === 'eq') { done(); if (!e.playing && (this.bands.length || this.bypass)) e.play(); return; }
+    // A loop started on the Original has no EQ in its path; it restarts in place to get one.
+    if (tab === 'eq') { done(); if (e.playing ? e.playEq === this.bypass : (this.bands.length || this.bypass)) e.play(!!e.playing); return; }
     if (this.bypass || this.viewKey() === this.quietKey) { done(); return void (inPlace ? e.play(true) : e.play()); }
     if (tab !== 'tool' && this.long()) { done(); return this.schedulePreview(0, !inPlace); }
     // The result is still being worked out: it calls back here when it is ready.

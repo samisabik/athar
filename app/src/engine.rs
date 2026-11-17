@@ -206,6 +206,7 @@ enum Cmd {
     GainSet(u64, Gain),
     Filter(u64, Option<[f32; 5]>),
     Drop(Vec<u64>),
+    StopAll,
 }
 
 struct Graph {
@@ -478,6 +479,11 @@ impl Engine {
         })));
     }
 
+    /// Silences everything at once and forgets every gain and filter.
+    pub fn stop_all(&self) {
+        let _ = self.tx.send(Cmd::StopAll);
+    }
+
     pub fn stop(&self, id: u64, when: f64) {
         let _ = self.tx.send(Cmd::Stop(id, ((when * self.rate() as f64).max(0.0)) as u64));
     }
@@ -543,6 +549,11 @@ impl Graph {
                     self.gains.remove(&id);
                     self.filters.remove(&id);
                 }
+            }
+            Cmd::StopAll => {
+                self.voices.clear();
+                self.gains.clear();
+                self.filters.clear();
             }
         }
     }

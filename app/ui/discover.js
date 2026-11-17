@@ -204,6 +204,7 @@ export class Discover {
   /** @param {string} url */
   async play(url) {
     if (this.playingUrl === url) return this.stop();
+    this.stop();
     this.h.stopOthers?.();
     // Archives can take several seconds to send a file, so the button shows the wait.
     this.playingUrl = url; this.waiting = true;

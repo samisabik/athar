@@ -558,7 +558,7 @@ export class Editor {
     const loop = this.loop, token = this.playToken = {};
     this.playLoop = loop; this.playA = a; this.playStart = start; this.playB = end; this.playT = now() + 0.03; this.playing = true;
     this.syncPlayBtn();
-    const eq = this.fx?.liveEq() || false;
+    const eq = this.playEq = this.fx?.liveEq() || false;
     let r;
     try { r = await invoke('ed_play', { p: { src, a: Math.max(0, a - base), b: end - base, start: start - base, loop, eq } }); }
     catch (e) { if (this.playToken === token) { this.playing = false; this.syncPlayBtn(); this.draw(); } return; }

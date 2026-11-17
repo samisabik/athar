@@ -730,7 +730,7 @@ body.indexing #toast { bottom: 92px; }
 .arr-playhead { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; margin-left: -1px; background: var(--hi); z-index: 1; pointer-events: none; }
 
 /* A download's progress, shown in place of its button's icon. */
-.ib.pct .i { font-family: inherit; font-size: 11px; font-variant-numeric: tabular-nums; }
+.ib.pct .i { font-family: inherit; font-size: 12px; font-weight: 700; color: var(--accent-text); font-variant-numeric: tabular-nums; }
 
 /* A found sound playing: its outline filled in the accent colour up to where it is. */
 .mini { position: relative; }
