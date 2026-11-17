@@ -374,22 +374,50 @@ fn emb_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-/// Where this app keeps its index: its own folder, so trying it never touches the index the
-/// Python app uses. On first launch it starts from a copy of that index, when there is one.
+/// Where the library lives. ATHAR_HOME points at another folder.
 pub fn data_dir() -> PathBuf {
     if let Ok(d) = std::env::var("ATHAR_HOME") {
         return PathBuf::from(d);
     }
-    let base = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Library/Application Support");
-    let d = base.join("Athar Next");
-    if !d.join("index.db").exists() {
-        let _ = std::fs::create_dir_all(&d);
-        let old = base.join("Athar/index.db");
-        if old.exists() {
-            let _ = std::fs::copy(&old, d.join("index.db"));
+    settle_home(&PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Library/Application Support"))
+}
+
+/// The library folder under `base`, which is `Athar`. Version 2.0.0 kept it in `Athar Next`,
+/// beside the Python app's `Athar`; on the first launch after that it moves back, and the Python
+/// app's folder is kept as `Athar 1.x backup`. A library from the Python app used in place has
+/// its index copied first, as `index-1.x.db`. The marker file records that this is done.
+pub fn settle_home(base: &Path) -> PathBuf {
+    const MARK: &str = ".native";
+    let home = base.join("Athar");
+    let next = base.join("Athar Next");
+    if home.join(MARK).exists() {
+        return home;
+    }
+    if next.join("index.db").exists() {
+        if home.exists() {
+            let mut backup = base.join("Athar 1.x backup");
+            let mut n = 2;
+            while backup.exists() {
+                backup = base.join(format!("Athar 1.x backup {n}"));
+                n += 1;
+            }
+            if std::fs::rename(&home, &backup).is_err() {
+                return next;
+            }
+        }
+        if std::fs::rename(&next, &home).is_err() {
+            return next;
+        }
+    } else if home.join("index.db").exists() {
+        for f in ["index.db", "index.db-wal"] {
+            if home.join(f).exists() && std::fs::copy(home.join(f), home.join(f.replace("index", "index-1.x"))).is_err() {
+                return home;
+            }
         }
     }
-    d
+    let _ = std::fs::create_dir_all(&home);
+    let _ = std::fs::write(home.join(MARK), "");
+    home
 }
 
 /// The model shipped in the app bundle, otherwise the copies made by packaging/export_model.py
