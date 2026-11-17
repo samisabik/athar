@@ -4,7 +4,7 @@
   "description": "Checks for the interface in athar/static: strict types (JSDoc, no build step) and tests.",
   "scripts": {
     "check": "tsc -p jsconfig.json",
-    "test": "node --test tests/*.mjs core/tests/js/*.test.mjs"
+    "test": "node --test core/tests/js/*.test.mjs"
   },
   "devDependencies": {
     "typescript": "5.9.3"

@@ -1,7 +1,7 @@
 import { lib } from './native.js';
 import { fmtTime } from './time.js';
 import { invoke, now, listen } from './engine.js';
-import { MAX_LANES, MAX_HITS, MAX_SECONDS, MIN_GAIN_DB, MAX_GAIN_DB, audible } from './arrange.js';
+import { MAX_LANES, MAX_HITS, MAX_SECONDS, MIN_GAIN_DB, MAX_GAIN_DB } from './arrange.js';
 import { ArrBrowser } from './arrbrowser.js';
 
 // Sizes the stylesheet shares: the lane heads' width and a lane's height (style.css, "arranger").
@@ -61,6 +61,9 @@ export class Arranger {
     this.zoomX = 0; this.zoomFrame = 0;
     /** @type {{ clip: Clip, t: number } | null} */ this.lastClick = null;
     /** @type {string | undefined} */ this.lastDest = undefined;
+    /** What the native side says is heard: each lane, the clips a mix would hold, the first lane heard.
+        @type {{ heard: boolean[], clips: number, first: string | null }} */
+    this.shown = { heard: [], clips: 0, first: null };
     const { el, ib, icon } = h;
     this.playBtn = ib('play_arrow', 'Play or stop (space)', () => this.toggle(), 'strong');
     this.loopBtn = ib('repeat', 'Loop (L)', () => this.set({ loop: !this.a.loop }), 'toggle');
@@ -130,7 +133,10 @@ export class Arranger {
   // after the changes stop.
   save() { this.push(false); clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), 300); }
   /** @param {boolean} store */
-  push(store) { return invoke('arr_set', { a: this.plain(), store }); }
+  async push(store) {
+    this.shown = await invoke('arr_set', { a: this.plain(), store });
+    this.scroll.querySelectorAll('.arr-row[data-li]').forEach((r) => r.classList.toggle('quiet', this.shown.heard[Number(/** @type {HTMLElement} */ (r).dataset.li)] === false));
+  }
   flush() {
     if (!this.saveTimer) return this.saving;
     clearTimeout(this.saveTimer); this.saveTimer = undefined;
@@ -526,7 +532,7 @@ export class Arranger {
         node.onpointerdown = (/** @type {PointerEvent} */ e) => this.dragClip(e, lane, clip, node);
         return node;
       }));
-    return el('div', { class: 'arr-row' + (audible(lane, this.a.lanes) ? '' : ' quiet'), 'data-li': li }, head, track);
+    return el('div', { class: 'arr-row' + (this.shown.heard[li] === false ? ' quiet' : ''), 'data-li': li }, head, track);
   }
 
   // Under the last lane: the way to make an empty lane, and the place a dragged sound becomes a new one.
@@ -595,13 +601,14 @@ export class Arranger {
   // ---- saving what is heard as one sound
   async bounce() {
     const { modal, notice, toast } = this.h, a = this.a;
-    const heard = this.all().filter(x => audible(x.lane, a.lanes) && this.sounds.get(x.clip.path)?.info);
-    if (!heard.length) return notice('No lane is sounding, so there is nothing to save.');
+    await this.push(false);
+    const { clips, first } = this.shown;
+    if (!clips) return notice('No lane is sounding, so there is nothing to save.');
     const [folders, projects] = await Promise.all([lib.folders(), lib.projects()]);
     /** @type {[string, string][]} */
     const options = [...projects.filter((/** @type {any} */ p) => p.folder).map((/** @type {any} */ p) => [`p:${p.id}`, `Project: ${p.name}`]), ...folders.filter((/** @type {any} */ f) => !f.offline).map((/** @type {any} */ f) => [`f:${f.path}`, `Library: ${f.path.split('/').pop()}`])];
     if (!options.length) return notice('Add a folder to the Library first, with Add folder on the Library page. The mix is saved there.');
-    const v = await modal(`Save the mix of ${plural(heard.length, 'clip')}`, [{ label: 'Name', value: `${heard[0].lane.name} mix` }, { label: 'Into', options, value: options.some(o => o[0] === this.lastDest) ? this.lastDest : undefined }]);
+    const v = await modal(`Save the mix of ${plural(clips, 'clip')}`, [{ label: 'Name', value: `${first || 'Arranger'} mix` }, { label: 'Into', options, value: options.some(o => o[0] === this.lastDest) ? this.lastDest : undefined }]);
     if (!v || !v[0]) return;
     this.lastDest = v[1];
     const proj = v[1].startsWith('p:') ? projects.find((/** @type {any} */ p) => `p:${p.id}` === v[1]) : null, dir = proj ? proj.folder : v[1].slice(2);

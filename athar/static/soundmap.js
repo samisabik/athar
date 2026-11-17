@@ -1,44 +1,13 @@
 import { lib } from './native.js';
+import { invoke } from './engine.js';
 import { fmtTime } from './time.js';
 
 const DOT = 4.5, HIT = 12, DWELL_MS = 140;
 
 /** The library as a map: sounds that sound alike sit near each other. Hover to hear, click to
     keep one, drag to move around, scroll to zoom. */
-// The broad family each kind of sound belongs to, for the names shown when the map is zoomed out.
-const FAMILIES = {
-  Drums: ['Kick', 'Snare', 'Clap', 'Hi-hat', 'Cymbal', 'Tom', 'Percussion', 'Drum loop'],
-  Bass: ['Bass', '808'],
-  Synth: ['Synth lead', 'Synth pad', 'Pluck', 'Chord'],
-  Instruments: ['Keys', 'Guitar', 'Strings', 'Brass', 'Bells'],
-  Voice: ['Vocal', 'Voices'],
-  FX: ['FX', 'Riser', 'Impact'],
-  Texture: ['Texture', 'Room tone'],
-  Nature: ['Birds', 'Insects', 'Animals', 'Water', 'Rain', 'Wind', 'Thunder', 'Fire'],
-  Foley: ['Foley', 'Footsteps', 'Doors', 'Metal', 'Wood', 'Paper'],
-  Machines: ['Traffic', 'Machinery'],
-};
-const FAMILY = Object.fromEntries(Object.entries(FAMILIES).flatMap(([family, kinds]) => kinds.map(k => [k, family])));
-
-// The words of a file name that can describe a sound: no numbers, note names, tempo or format.
-const DULL = new Set(['wav', 'aif', 'aiff', 'flac', 'mp3', 'ogg', 'm4a', 'bpm', 'one', 'shot', 'oneshot', 'loop', 'the', 'and', 'edit', 'min', 'maj', 'sample']);
-/** @param {string} name */
-function wordsOf(name) {
-  return name.toLowerCase().split(/[^a-z]+/).filter(w => w.length > 2 && !DULL.has(w));
-}
-// A word that most file names in a group share, if there is one, leaving out the name of the
-// kind itself and the words every file has.
-/** @param {Point[]} group @param {Set<string>} common */
-function sharedWord(group, common) {
-  /** @type {Map<string, number>} */
-  const count = new Map(), kind = new Set(wordsOf(group[0].category || ''));
-  for (const p of group) for (const w of new Set(wordsOf(p.name))) if (!common.has(w) && !kind.has(w)) count.set(w, (count.get(w) || 0) + 1);
-  const [word, n] = [...count].sort((a, b) => b[1] - a[1])[0] || [];
-  return word && n >= 2 && n >= group.length * 0.5 ? word : '';
-}
-
 /** A sound on the map, at x and y between 0 and 1.
-    @typedef {{ path: string, name: string, x: number, y: number, category: string | null, duration: number, sr: number }} Point */
+    @typedef {{ path: string, name: string, x: number, y: number, category: string | null, family: string | null, duration: number, sr: number }} Point */
 /** A group name at the middle of its sounds; key is `g:` and a family or `c:` and a kind. @typedef {{ key: string, text: string, n: number, x: number, y: number }} Name */
 /** Where a group name was drawn, to find it under the pointer. @typedef {{ x: number, y: number, w: number, h: number, name: string }} NameBox */
 /** @typedef {typeof import('./ui.js')} UI */
@@ -66,8 +35,8 @@ export class SoundMap {
     /** @type {[number, number] | null | undefined} */ this.pointer;
     /** @type {NameBox[] | undefined} */ this.labels;
     /** @type {{ key: string, canvas: HTMLCanvasElement } | undefined} */ this.land;
-    /** @type {{ stamp: string, level: number, list: Name[] } | undefined} */ this.named;
-    /** @type {{ stamp: string, words: Set<string> } | undefined} */ this.common;
+    /** The names for one zoom step, and the step asked for. @type {{ stamp: string, level: number, list: Name[] } | undefined} */ this.named;
+    /** @type {string | undefined} */ this.namesWant;
     const { el, ib } = h;
     this.canvas = el('canvas', { class: 'map-canvas', tabindex: '0', 'aria-label': 'Map of your sounds' });
     this.info = el('div', { class: 'map-info' });
@@ -124,7 +93,7 @@ export class SoundMap {
     // Sounds show near the pointer, for the kind in focus, and everywhere once zoomed in.
     const near = this.pointer, everywhere = this.zoom >= 2.5;
     this.points.forEach((p, i) => {
-      const [x, y] = at[i], close = near && (x - near[0]) ** 2 + (y - near[1]) ** 2 < 90 * 90, inFocus = focus && (focus === `c:${p.category}` || focus === `g:${FAMILY[/** @type {string} */ (p.category)] || p.category}`);
+      const [x, y] = at[i], close = near && (x - near[0]) ** 2 + (y - near[1]) ** 2 < 90 * 90, inFocus = focus && (focus === `c:${p.category}` || focus === `g:${p.family}`);
       if (!close && !inFocus && !everywhere) return;
       g.beginPath(); g.arc(x, y, inFocus ? DOT : DOT - 1, 0, Math.PI * 2);
       g.fillStyle = inFocus ? col('--ink') : col('--raised'); g.fill();
@@ -213,47 +182,21 @@ export class SoundMap {
     return canvas;
   }
 
-  // The names to show at the current zoom, biggest group first, in map units. The map is cut
-  // into squares that halve each time the zoom doubles; in each square the most common family
-  // (far out) or kind (closer in) is named, at the middle of its sounds there. Worked out once
-  // per zoom step and set of sounds.
+  // The names to show at the current zoom, biggest group first, in map units. They are worked
+  // out natively (app/src/mapnames.rs) once per zoom step and set of sounds; until they arrive the
+  // last ones stay, and the map redraws when they come.
   names() {
-    const level = Math.min(5, Math.floor(Math.log2(this.zoom) + 0.35));
+    const level = Math.min(5, Math.floor(Math.log2(this.zoom) + 0.35)), want = `${this.stamp}|${level}`;
     if (this.named?.stamp === this.stamp && this.named.level === level) return this.named.list;
-    const cell = 0.26 / 2 ** level, broad = level === 0, cells = /** @type {Map<string, Map<string, Point[]>>} */ (new Map());
-    for (const p of this.points) {
-      if (!p.category) continue;
-      const key = broad ? `g:${FAMILY[p.category] || p.category}` : `c:${p.category}`, id = `${Math.floor(p.x / cell)},${Math.floor(p.y / cell)}`;
-      const kinds = /** @type {Map<string, Point[]>} */ (cells.get(id) || cells.set(id, new Map()).get(id));
-      /** @type {Point[]} */ (kinds.get(key) || kinds.set(key, []).get(key)).push(p);
+    if (this.namesWant !== want) {
+      this.namesWant = want;
+      const stamp = this.stamp;
+      invoke('map_names', { level }).then((/** @type {Name[]} */ list) => {
+        if (this.namesWant !== want) return;
+        this.named = { stamp, level, list }; this.draw();
+      }).catch(() => { });
     }
-    const least = broad ? 3 : 2, all = /** @type {Name[]} */ ([]);
-    for (const kinds of cells.values()) {
-      const [key, group] = [...kinds].sort((a, b) => b[1].length - a[1].length)[0];
-      if (group.length < least) continue;
-      const word = level >= 2 ? sharedWord(group, this.commonWords()) : '';
-      all.push({ key, text: word ? word[0].toUpperCase() + word.slice(1) : key.slice(2), n: group.length,
-        x: group.reduce((t, p) => t + p.x, 0) / group.length, y: group.reduce((t, p) => t + p.y, 0) / group.length });
-    }
-    // The same name in neighbouring squares is one group cut in two: the bigger half keeps it.
-    /** @type {Name[]} */
-    const list = [];
-    for (const l of all.sort((a, b) => b.n - a.n)) {
-      if (!list.some(k => k.text === l.text && Math.abs(k.x - l.x) < cell * 1.2 && Math.abs(k.y - l.y) < cell * 1.2)) list.push(l);
-    }
-    this.named = { stamp: this.stamp, level, list };
-    return list;
-  }
-
-  // Words in more than a third of all file names (a pack's own name, say) describe nothing.
-  commonWords() {
-    if (this.common?.stamp === this.stamp) return this.common.words;
-    /** @type {Map<string, number>} */
-    const count = new Map();
-    for (const p of this.points) for (const w of new Set(wordsOf(p.name))) count.set(w, (count.get(w) || 0) + 1);
-    const words = new Set([...count].filter(([, n]) => n > this.points.length / 3).map(([w]) => w));
-    this.common = { stamp: this.stamp, words };
-    return words;
+    return this.named?.list || [];
   }
 
   /** @param {number} x @param {number} y */

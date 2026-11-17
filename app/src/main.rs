@@ -12,6 +12,7 @@ mod events;
 mod finder_drop;
 mod input;
 mod library;
+mod mapnames;
 mod sp404;
 mod tsne;
 
@@ -413,6 +414,37 @@ fn ed_eq(ed: Ed, bands: Vec<Value>) {
     ed.set_eq(&bands);
 }
 
+/// The names written on the Map at zoom `level` (see mapnames.rs).
+#[tauri::command(async)]
+fn map_names(lib: Lib, level: u32) -> Value {
+    mapnames::names(&lib.inner().sound_map(), level)
+}
+
+/// An effect's transfer curve, drawn by its panel: the output level in dB for `n` input levels
+/// from `from` to `to` dB, from the same formulas the effect runs.
+#[tauri::command(async)]
+fn fx_curve(tab: String, p: Value, from: f64, to: f64, n: usize) -> Vec<f64> {
+    use athar_core::dsp;
+    let n = n.clamp(2, 4096);
+    let x = |k: usize| from + (to - from) * k as f64 / (n - 1) as f64;
+    match tab.as_str() {
+        "comp" => {
+            let c = dsp::CompParams::from_json(&p);
+            let up = if p["autoMakeup"].as_bool().unwrap_or(true) { dsp::auto_makeup(&c) } else { p["makeup"].as_f64().unwrap_or(0.0) };
+            (0..n).map(|k| dsp::comp_curve(x(k), &c) + up).collect()
+        }
+        "sat" => {
+            let c = dsp::SatParams::from_json(&p);
+            (0..n).map(|k| dsp::sat_curve(x(k), c.drive, c.ceiling)).collect()
+        }
+        "max" => {
+            let (gain, ceiling) = (p["gain"].as_f64().unwrap_or(0.0), p["ceiling"].as_f64().unwrap_or(-1.0));
+            (0..n).map(|k| (x(k) + gain).min(ceiling)).collect()
+        }
+        _ => (0..n).map(x).collect(),
+    }
+}
+
 /// The EQ curve: dB per band at each frequency, drawn by the page.
 #[tauri::command(async)]
 fn eq_response(audio: Audio, bands: Vec<Value>, freqs: Vec<f64>) -> Vec<Vec<f32>> {
@@ -439,12 +471,12 @@ fn arr_play(arr: ArrS, from: f64) -> f64 {
 
 /// The arrangement changed: what plays follows, and with `store` it is kept for next time.
 #[tauri::command(async)]
-fn arr_set(lib: Lib, arr: ArrS, a: Value, store: bool) -> Res<()> {
-    arr.set(a.clone());
+fn arr_set(lib: Lib, arr: ArrS, a: Value, store: bool) -> Res<Value> {
+    let shown = arr.set(a.clone());
     if store {
         lib.arrangement_set(&a).map_err(|e| format!("Bad arrangement: {e}"))?;
     }
-    Ok(())
+    Ok(shown)
 }
 
 /// The lanes that are heard mixed and saved as a new file. Returns its path and how many dB
@@ -830,7 +862,7 @@ fn main() {
             rename_project, delete_project, project_item, project_folder, project_order, set_project_order, project_pads,
             set_project_pads, arrangement, set_arrangement, discover_sources, not_yet,
             pick_folder, pick_file, debug_log, set_dirty, quit_now, export_project, backup, restore, discover_search,
-            discover_waveform, discover_files, discover_save, discover_preview, audio_info, audio_poll, audio_preview, audio_start, rec_devices, rec_start, rec_stop, rec_discard, ed_open, ed_saved, ed_regions, ed_edit, ed_undo, ed_view, ed_noise, ed_analyse, ed_peaks, ed_spec, ed_play, ed_stop, ed_eq, eq_response, audio_volume, audio_watch_spectrum, ed_save, ed_download, rec_save, batch_save, arr_load, arr_keep, arr_play, arr_set, arr_stop, arr_save,
+            discover_waveform, discover_files, discover_save, discover_preview, audio_info, audio_poll, audio_preview, audio_start, rec_devices, rec_start, rec_stop, rec_discard, ed_open, ed_saved, ed_regions, ed_edit, ed_undo, ed_view, ed_noise, ed_analyse, ed_peaks, ed_spec, ed_play, ed_stop, ed_eq, eq_response, fx_curve, map_names, audio_volume, audio_watch_spectrum, ed_save, ed_download, rec_save, batch_save, arr_load, arr_keep, arr_play, arr_set, arr_stop, arr_save,
             audio_stop
         ])
         .setup(|app| {

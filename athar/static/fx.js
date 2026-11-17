@@ -1,4 +1,4 @@
-import { db, compCurve, autoMakeup, satCurve, NR_N, noteAt } from './curves.js';
+import { db, NR_N, noteAt } from './units.js';
 import { TOOLS } from './tools.js';
 import { invoke, rate, listen } from './engine.js';
 
@@ -103,6 +103,10 @@ export class FxPanel {
     this.sat = { ...DEFAULTS.sat }; this.shape = { ...DEFAULTS.shape }; this.lofi = { ...DEFAULTS.lofi };
     /** Asks which of two ways to go: resolves 'ok', 'alt' or something else for neither. @type {((title: string, text: string, ok: string, alt: string) => Promise<string | null>) | null} */
     this.choose = null;
+    /** The transfer curve last drawn, and the one asked for. @type {{ key: string, out: number[] } | null} */
+    this.sideCurve = null;
+    /** @type {string | null} */
+    this.sideWant = null;
     /** Told which section is open, for the cat's lessons. @type {((name: string | null) => void) | null} */
     this.onSection = null;
     /** @type {{ scale: string, key: number } | null} */
@@ -1026,16 +1030,20 @@ export class FxPanel {
         g.fillText(String(d), X(d) + 2, H - 3);
       }
       g.setLineDash([3, 3]); g.beginPath(); g.moveTo(0, H); g.lineTo(W, 0); g.stroke(); g.setLineDash([]);
-      g.beginPath();
-      for (let x = 0; x <= W; x++) {
-        const i = x / W * R - R;
-        let o;
-        if (this.tab === 'comp') o = compCurve(i, this.comp) + (this.comp.autoMakeup ? autoMakeup(this.comp) : this.comp.makeup);
-        else if (this.tab === 'sat') o = satCurve(i, this.sat);
-        else o = Math.min(this.max.ceiling, i + this.max.gain);
-        x ? g.lineTo(x, Y(o)) : g.moveTo(x, Y(o));
+      // The curve comes from the effect's own formulas, natively; the panel redraws when it arrives.
+      const n = Math.ceil(W) + 1, tab = this.tab, key = JSON.stringify([tab, this.params(tab), n]);
+      if (this.sideCurve?.key === key) {
+        const out = this.sideCurve.out;
+        g.beginPath();
+        out.forEach((o, x) => { x ? g.lineTo(x, Y(o)) : g.moveTo(x, Y(o)); });
+        g.strokeStyle = css('--accent'); g.lineWidth = 2; g.stroke();
+      } else if (this.sideWant !== key) {
+        this.sideWant = key;
+        invoke('fx_curve', { tab, p: this.params(tab), from: -R, to: 0, n }).then((/** @type {number[]} */ out) => {
+          if (this.sideWant !== key) return;
+          this.sideCurve = { key, out }; this.drawSide();
+        }).catch(() => { });
       }
-      g.strokeStyle = css('--accent'); g.lineWidth = 2; g.stroke();
       g.fillStyle = css('--muted'); g.fillText('in →', W - 34, H - 14); g.fillText('out', 4, 12);
     } else if (this.tab === 'nr') {
       const e = this.ed; if (!e.loaded) return;

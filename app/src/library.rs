@@ -1359,7 +1359,13 @@ impl Library {
         let limit = q.limit.unwrap_or(200).max(0) as usize;
         let name_of = |i: usize| basename(&store.items[i].meta.path).to_lowercase();
         let sort = if vec.is_some() || q.sort.as_deref() != Some("score") { q.sort.clone().unwrap_or("score".into()) } else { "name".into() };
+        // A project's own order, as arranged on the Projects page; sounds without a place go last.
+        let order: HashMap<String, usize> = match (sort.as_str(), q.project) {
+            ("project", Some(pid)) => self.project_order(pid).as_array().into_iter().flatten().enumerate().filter_map(|(k, p)| Some((p.as_str()?.to_string(), k))).collect(),
+            _ => HashMap::new(),
+        };
         match sort.as_str() {
+            "project" => idx.sort_by_key(|&i| (order.get(&store.items[i].meta.path).copied().unwrap_or(usize::MAX), name_of(i))),
             "score" if vec.is_some() => idx.sort_by(|&a, &b| scores[b].total_cmp(&scores[a])),
             "rating" => idx.sort_by_key(|&i| std::cmp::Reverse(cat_rows.get(&store.items[i].meta.path).map(|c| c.2).unwrap_or(0))),
             "recorded" => idx.sort_by_key(|&i| {
@@ -1519,7 +1525,7 @@ impl Library {
                 .enumerate()
                 .map(|(i, it)| {
                     json!({"path": it.meta.path, "name": basename(&it.meta.path), "x": (xy[i][0] * 1e4).round() / 1e4, "y": (xy[i][1] * 1e4).round() / 1e4,
-                           "category": it.cat.map(|c| names[c.0].clone()), "duration": it.meta.duration, "sr": it.meta.sr})
+                           "category": it.cat.map(|c| names[c.0].clone()), "family": it.cat.map(|c| crate::mapnames::family(&names[c.0]).to_string()), "duration": it.meta.duration, "sr": it.meta.sr})
                 })
                 .collect(),
         );

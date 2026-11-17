@@ -111,10 +111,19 @@ impl Arr {
 
     /// The arrangement as stored; while playing, lane levels follow at once and the rest from
     /// the next pass.
-    pub fn set(&self, plain: Value) {
+    /// Returns what the page shows of it: whether each lane is heard, how many heard clips have
+    /// a sound to mix, and the name of the first lane heard.
+    pub fn set(&self, plain: Value) -> Value {
         self.st.lock().unwrap().plain = plain;
         let a = self.plan();
+        let st = self.st.lock().unwrap();
+        let lanes = st.plain["lanes"].as_array().cloned().unwrap_or_default();
+        let heard: Vec<bool> = lanes.iter().map(|l| Self::audible(l, &lanes)).collect();
+        let clips: usize = a.lanes.iter().filter(|l| l.gain > 0.0).map(|l| l.clips.len()).sum();
+        let first = lanes.iter().zip(&a.lanes).find(|(_, l)| l.gain > 0.0 && !l.clips.is_empty()).and_then(|(l, _)| l["name"].as_str().map(String::from));
+        drop(st);
         self.update(a);
+        json!({"heard": heard, "clips": clips, "first": first})
     }
 
     /// Whether a lane sounds: not muted, and soloed when any lane is.
@@ -353,7 +362,7 @@ mod tests {
         let lanes = |mute: bool, solo: bool| json!({"loop": false, "lanes": [{"gain": 0, "mute": mute, "clips": [{"path": a, "at": 0}]}, {"gain": 0, "solo": solo, "clips": [{"path": b, "at": 0}]}]});
         arr.set(lanes(false, false));
         assert_eq!(arr.heard().len(), 2);
-        arr.set(lanes(true, false));
+        assert_eq!(arr.set(lanes(true, false))["heard"], json!([false, true]));
         assert_eq!(arr.heard().iter().map(|h| h.0.path.clone()).collect::<Vec<_>>(), vec![b.clone()]);
         arr.set(lanes(false, true));
         assert_eq!(arr.heard().iter().map(|h| h.0.path.clone()).collect::<Vec<_>>(), vec![b.clone()]);

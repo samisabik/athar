@@ -134,11 +134,7 @@ export async function renderProjectCard() {
   }
   const p = projShut ? null : state.projects.find(x => x.id === projSel);
   /** @type {Item[]} */
-  let items = p?.n ? await lib.search({ project: p.id, sort: 'name', limit: 5000 }) : [];
-  if (p && items.length > 1) {
-    const order = /** @type {string[]} */ (await lib.projectOrder(p.id)), at = new Map(order.map((path, k) => [path, k]));
-    items.sort((a, b) => (at.get(a.path) ?? 1e9) - (at.get(b.path) ?? 1e9));
-  }
+  const items = p?.n ? await lib.search({ project: p.id, sort: 'project', limit: 5000 }) : [];
   const pads = padView && p && items.length ? await lib.projectPads(p.id) : {};
   if (seq !== projSeq) return;
   const count = (/** @type {number} */ n) => `${n} sound${n === 1 ? '' : 's'}`;
