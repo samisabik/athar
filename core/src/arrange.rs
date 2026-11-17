@@ -1,7 +1,6 @@
-//! Port of the mixdown in `athar/static/arrange.js`.
+//! The Arranger's mixdown, ported from its first JavaScript version.
 
 use crate::dsp::{db, encode_wav_seeded, jround, lin, mix_mono, random_seed, resample_sinc};
-use serde_json::Value;
 use std::f64::consts::PI;
 
 /// Fade lengths in seconds for one hit.
@@ -22,26 +21,7 @@ pub struct MixLane {
     pub fades: Vec<Option<Fade>>,
 }
 
-impl MixLane {
-    /// Builds a lane from its worker.js JSON (`{ sr, gain, hits, fades: [{ in, out }] }`, without
-    /// `chs`) and its channels.
-    pub fn from_json(v: &Value, chs: Vec<Vec<f32>>) -> Self {
-        let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
-        MixLane {
-            chs,
-            sr: f(v, "sr").unwrap_or(0.0) as u32,
-            gain: f(v, "gain").unwrap_or(1.0),
-            hits: v.get("hits").and_then(Value::as_array).map_or(vec![], |a| a.iter().filter_map(Value::as_f64).collect()),
-            fades: v.get("fades").and_then(Value::as_array).map_or(vec![], |a| {
-                a.iter()
-                    .map(|x| x.is_object().then(|| Fade { fade_in: f(x, "in").unwrap_or(0.0), fade_out: f(x, "out").unwrap_or(0.0) }))
-                    .collect()
-            }),
-        }
-    }
-}
-
-/// The non-lane arguments of `renderMix`. `dither_seed` fixes the 16-bit dither (None: random).
+/// How a mix is rendered. `dither_seed` fixes the 16-bit dither (None: random).
 #[derive(Debug, Clone, Copy)]
 pub struct MixArgs {
     pub sr: u32,
@@ -51,24 +31,6 @@ pub struct MixArgs {
     pub mono: bool,
     pub fade_end: bool,
     pub dither_seed: Option<u32>,
-}
-
-impl MixArgs {
-    /// Reads `{ sr, seconds, rate, bits, mono, fadeEnd, ditherSeed? }` as worker.js receives them.
-    pub fn from_json(v: &Value) -> Self {
-        let f = |k: &str| v.get(k).and_then(Value::as_f64);
-        let b = |k: &str| v.get(k).is_some_and(|x| x.as_bool().unwrap_or_else(|| x.as_f64().is_some_and(|n| n != 0.0)));
-        let sr = f("sr").unwrap_or(44100.0) as u32;
-        MixArgs {
-            sr,
-            seconds: f("seconds").unwrap_or(0.0),
-            rate: f("rate").map_or(sr, |r| r as u32),
-            bits: f("bits").map_or(16, |r| r as u32),
-            mono: b("mono"),
-            fade_end: b("fadeEnd"),
-            dither_seed: f("ditherSeed").map(|s| s as u32),
-        }
-    }
 }
 
 /// The saved mix: WAV bytes, and how far over full scale the mix went in dB (0 when it fit).
@@ -149,9 +111,8 @@ pub fn fit_peak(channels: &mut [Vec<f32>]) -> f64 {
     db(peak)
 }
 
-/// arrange.js `renderMix`: mix, fold to mono if asked, fade the cut end, convert the rate, fit
-/// the peak, encode. A host passes the worker.js `mix` args as `MixArgs::from_json(&args)` and
-/// one `MixLane::from_json(&args.lanes[i], channels_i)` per lane.
+/// The whole save of a mix: mix, fold to mono if asked, fade the cut end, convert the rate, fit
+/// the peak, encode.
 pub fn render_mix(lanes: &[MixLane], a: &MixArgs) -> Result<Mix, String> {
     let mut c = mixdown(lanes, a.sr, a.seconds);
     if a.mono && c.len() > 1 {

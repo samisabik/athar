@@ -1,5 +1,5 @@
-//! Checks the Rust core against outputs of the Python engine (tests/reference, written by
-//! packaging/make_reference.py).
+//! Checks the Rust core against outputs saved from the former Python engine (tests/reference),
+//! so the vectors stored in existing libraries stay valid.
 
 use athar_core::features::{clap_features, FRAMES, N_MELS};
 use ndarray::ArrayD;
@@ -7,7 +7,7 @@ use ndarray_npy::read_npy;
 use std::path::PathBuf;
 
 pub fn reference(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tests/reference").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/reference").join(name)
 }
 
 pub const SOUNDS: [&str; 5] = ["kick_44k_mono", "tone_440_48k", "noise_burst_44k", "chirp_stereo_16s", "loop_120bpm_22k"];

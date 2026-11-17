@@ -1,10 +1,14 @@
+# /// script
+# requires-python = ">=3.11,<3.14"
+# dependencies = ["onnx==1.23.2", "onnxruntime==1.31.1"]
+# ///
 """Write build/model-audio-pc/audio.onnx: the CLAP audio model with int8 weights, per channel.
 
-Against the full model its embeddings agree at cosine 0.9997 on a real library
-(packaging/compare_int8.py), it is a quarter of the size, and it lets several sessions index
-side by side in the memory one full-size session takes.
+Against the full model its embeddings agree at cosine 0.9997 on a real library, it is a quarter
+of the size, and it lets several sessions index side by side in the memory one full-size
+session takes. Run packaging/export_model.py first.
 
-uv run python packaging/quantize_audio.py
+uv run packaging/quantize_audio.py
 """
 from pathlib import Path
 

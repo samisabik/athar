@@ -15,7 +15,7 @@
     "skipLibCheck": true
   },
   "include": [
-    "athar/static/*.js",
-    "athar/static/types.d.ts"
+    "app/ui/*.js",
+    "app/ui/types.d.ts"
   ]
 }

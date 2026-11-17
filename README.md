@@ -60,8 +60,14 @@ Athar runs on Apple silicon Macs with macOS 12 or later.
 
 ## From source
 
-Athar needs [uv](https://docs.astral.sh/uv/). `Build Athar.command` exports the search model and builds the app. `Athar.command` runs it from source once the model exists in `build/model`. `Test Athar.command` runs every automated check.
+The app is Rust with a [Tauri](https://tauri.app) window. `core/` holds decoding, search and audio processing, `app/` the macOS app built on it, and `app/ui/` the interface the window shows.
+
+You need [Rust](https://rustup.rs), the Tauri CLI (`cargo install tauri-cli`), [uv](https://docs.astral.sh/uv/) to export the search model once, and Node.js for the interface's type checks.
+
+1. Export the search model into `build/`: `uv run packaging/export_model.py`, then `uv run packaging/quantize_audio.py`.
+2. Build the app with `app/bundle.sh`. It writes `app/target/release/bundle/macos/Athar.app`.
+3. Run the checks: `cargo test --release` in `core/` and in `app/`, and `npm install`, then `npm run check` for the interface.
 
 ## Licence
 
-Athar is released under the MIT licence, in `LICENSE`. The bundled fonts keep their own licences, in `athar/static/fonts/`.
+Athar is released under the MIT licence, in `LICENSE`. The bundled fonts keep their own licences, in `app/ui/fonts/`.

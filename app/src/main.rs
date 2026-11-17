@@ -53,7 +53,7 @@ fn ui_dir(resources: Option<&Path>) -> PathBuf {
     // repository's own files, not the copy the build leaves next to the binary, which is only
     // refreshed when the app is bundled.
     let in_app = std::env::current_exe().is_ok_and(|p| p.to_string_lossy().contains(".app/Contents/MacOS/"));
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../athar/static");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
     if !in_app && repo.join("index.html").exists() {
         return repo;
     }

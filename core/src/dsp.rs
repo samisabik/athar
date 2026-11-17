@@ -1,5 +1,5 @@
-//! Port of `athar/static/dsp.js`. Arithmetic runs in f64 and buffers are f32, in the same order
-//! as the JavaScript, so results match it to within float rounding.
+//! The editor's audio processing, ported from its first JavaScript version. Arithmetic runs in
+//! f64 and buffers are f32, in the order that version used, so results matched it exactly.
 
 #![allow(clippy::needless_range_loop, clippy::manual_clamp)]
 

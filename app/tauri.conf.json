@@ -4,7 +4,7 @@
   "version": "1.7.0",
   "identifier": "local.athar.next",
   "build": {
-    "frontendDist": "../athar/static"
+    "frontendDist": "ui"
   },
   "app": {
     "withGlobalTauri": false,
@@ -24,7 +24,7 @@
     ],
     "category": "Music",
     "resources": {
-      "../athar/static/": "ui/",
+      "ui/": "ui/",
       "../build/model/text.onnx": "model/text.onnx",
       "../build/model/tokenizer.json": "model/tokenizer.json",
       "../build/model-audio-pc/audio.onnx": "model/audio.onnx"

@@ -118,7 +118,6 @@ dependencies = [
  "rayon",
  "realfft",
  "rubato",
- "rusqlite",
  "serde_json",
  "symphonia",
  "tokenizers",
