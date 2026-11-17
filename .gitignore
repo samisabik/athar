@@ -8,3 +8,5 @@ __pycache__/
 *.egg-info/
 .claude/
 .ruff_cache/
+
+core/target/
