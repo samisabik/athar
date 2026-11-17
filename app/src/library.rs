@@ -53,6 +53,7 @@ const NONSENSE: [&str; 5] = ["xq vlorp", "mmbrrt kazoodle", "fhqwhgads", "plinth
 /// Above nonsense: the best a query must score to count as finding anything, and what each sound keeps.
 const QUERY_FOUND: f32 = 0.25;
 const QUERY_KEEP: f32 = 0.15;
+const OLD_NAME_PATTERN: &str = "{project}_{category}_{n:03d}_{name}";
 const ROOM_TONE: (&str, &str) = ("Room tone", "quiet room tone or background hum");
 
 const SCHEMA: &str = "
@@ -309,6 +310,8 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 // ---------- the library
 
+type Embed<'a> = &'a (dyn Fn(&[Vec<f32>]) -> Option<Vec<f32>> + Sync);
+
 enum Job {
     Folder(String),
     Files(String, Vec<String>),
@@ -407,7 +410,14 @@ pub fn model_dir(resources: Option<&Path>) -> PathBuf {
 
 impl Library {
     pub fn open(model: PathBuf) -> Res<Arc<Self>> {
-        let data_dir = data_dir();
+        let (lib, rx) = Self::create(data_dir(), model)?;
+        let l = lib.clone();
+        std::thread::spawn(move || l.boot(rx));
+        Ok(lib)
+    }
+
+    /// The library on its index in data_dir, before the model loads and the queue starts.
+    fn create(data_dir: PathBuf, model: PathBuf) -> Res<(Arc<Self>, Receiver<Job>)> {
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
         let db_path = data_dir.join("index.db");
         let db = Connection::open(&db_path).map_err(|e| e.to_string())?;
@@ -448,9 +458,7 @@ impl Library {
             data_dir,
         });
         lib.daily_backup();
-        let l = lib.clone();
-        std::thread::spawn(move || l.boot(rx));
-        Ok(lib)
+        Ok((lib, rx))
     }
 
     fn boot(self: Arc<Self>, rx: Receiver<Job>) {
@@ -485,10 +493,12 @@ impl Library {
         if self.settings()["rescan_on_open"].as_bool().unwrap_or(true) {
             self.rescan();
         }
+        let clap = self.engine.get().unwrap();
+        let embed = |cl: &[Vec<f32>]| clap.embed_sound(cl).ok();
         while let Ok(job) = rx.recv() {
             match job {
-                Job::Folder(f) => self.scan(&f),
-                Job::Files(f, paths) => self.index(&f, paths),
+                Job::Folder(f) => self.scan(&f, &embed),
+                Job::Files(f, paths) => self.index(&f, paths, &embed),
             }
             self.pending.fetch_sub(1, Ordering::SeqCst);
             let mut s = self.status.lock().unwrap();
@@ -589,6 +599,11 @@ impl Library {
         if let Some(saved) = self.meta_get("settings").and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
             if let (Some(o), Some(saved)) = (st.as_object_mut(), saved.as_object()) {
                 for (k, v) in saved {
+                    // Settings are saved whole, so a library from before the default naming
+                    // pattern changed holds the old default as if it had been chosen.
+                    if k == "name_pattern" && v == OLD_NAME_PATTERN {
+                        continue;
+                    }
                     if o.contains_key(k) {
                         o.insert(k.clone(), v.clone());
                     }
@@ -596,7 +611,12 @@ impl Library {
             }
         }
         if st["projects_dir"].as_str().unwrap_or("").is_empty() {
-            st["projects_dir"] = json!(PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Music/Athar Projects"));
+            // Started on its own data folder (tests, trials), Athar keeps projects in there too.
+            st["projects_dir"] = if std::env::var_os("ATHAR_HOME").is_some() {
+                json!(self.data_dir.join("Projects"))
+            } else {
+                json!(PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Music/Athar Projects"))
+            };
         }
         st
     }
@@ -846,7 +866,7 @@ impl Library {
 
     // ---------- indexing
 
-    fn scan(&self, folder: &str) {
+    fn scan(&self, folder: &str, embed: Embed) {
         if !Path::new(folder).is_dir() {
             return;
         }
@@ -913,11 +933,10 @@ impl Library {
             }
         }
         todo.sort();
-        self.index(folder, todo);
+        self.index(folder, todo, embed);
     }
 
-    fn index(&self, folder: &str, paths: Vec<String>) {
-        let Some(clap) = self.engine.get() else { return };
+    fn index(&self, folder: &str, paths: Vec<String>, embed: Embed) {
         {
             let mut s = self.status.lock().unwrap();
             s.folder = Some(folder.to_string());
@@ -935,7 +954,7 @@ impl Library {
                 .map(|p| {
                     let prep = prepare(folder, p);
                     let emb = match &prep {
-                        Prepared::Ok(_, cl) => clap.embed_sound(cl).ok(),
+                        Prepared::Ok(_, cl) => embed(cl),
                         _ => None,
                     };
                     (prep, emb)
@@ -953,8 +972,12 @@ impl Library {
                         if !Path::new(&row.meta.path).exists() {
                             continue;
                         }
+                        let before: Option<String> = self.db().query_row("SELECT sha1 FROM files WHERE path=?", [&row.meta.path], |r| r.get(0)).optional().ok().flatten().flatten();
                         if self.save_row(&row, Some(&emb)).is_ok() {
-                            self.reattach(&row.meta.path, row.sha1.as_deref());
+                            let replaced = before.is_some() && before != row.sha1;
+                            if let Some(old) = self.reattach(&row.meta.path, row.sha1.as_deref(), replaced) {
+                                self.move_in_arrangement(&old, &row.meta.path);
+                            }
                             let cat = self.category_of(&emb);
                             self.store.write().unwrap().put(row.meta.clone(), emb, cat);
                         }
@@ -1000,10 +1023,14 @@ impl Library {
         self.store.write().unwrap().drop_path(path);
     }
 
-    fn reattach(&self, path: &str, sha1: Option<&str>) {
+    /// Give a newly indexed file the tags, regions and project places of a vanished file with
+    /// the same content, and return that file's path. Its own tags give way only when replaced
+    /// is true: other content was indexed at this path before, so the vanished file was moved
+    /// over it.
+    fn reattach(&self, path: &str, sha1: Option<&str>, replaced: bool) -> Option<String> {
         let db = self.db();
         let _ = db.execute("DELETE FROM gone WHERE path = ?", [path]);
-        let Some(sha1) = sha1 else { return };
+        let sha1 = sha1?;
         let olds: Vec<String> = {
             let mut st = db.prepare("SELECT path FROM gone WHERE sha1 = ? ORDER BY at DESC").unwrap();
             st.query_map([sha1], |r| r.get(0)).unwrap().flatten().collect()
@@ -1014,6 +1041,10 @@ impl Library {
                 continue;
             }
             for t in ["catalog", "regions"] {
+                let theirs: bool = db.query_row(&format!("SELECT 1 FROM {t} WHERE path = ?"), [&old], |_| Ok(true)).optional().ok().flatten().unwrap_or(false);
+                if theirs && replaced {
+                    let _ = db.execute(&format!("DELETE FROM {t} WHERE path = ?"), [path]);
+                }
                 let has: bool = db.query_row(&format!("SELECT 1 FROM {t} WHERE path = ?"), [path], |_| Ok(true)).optional().ok().flatten().unwrap_or(false);
                 if !has {
                     let _ = db.execute(&format!("UPDATE {t} SET path = ? WHERE path = ?"), [path, &old]);
@@ -1021,8 +1052,9 @@ impl Library {
             }
             let _ = db.execute("UPDATE OR IGNORE project_items SET path = ? WHERE path = ?", [path, &old]);
             let _ = db.execute("DELETE FROM project_items WHERE path = ?", [&old]);
-            return;
+            return Some(old);
         }
+        None
     }
 
     // ---------- files
@@ -1214,10 +1246,11 @@ impl Library {
     }
 
     pub fn arrangement_get(&self) -> Value {
-        self.meta_get("arrangement").and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(json!({"loop": true, "lanes": []}))
+        self.meta_get("arrangement").and_then(|s| serde_json::from_str(&s).ok()).map(|a| lanes_of_clips(&a)).unwrap_or(json!({"loop": true, "lanes": []}))
     }
 
     pub fn arrangement_set(&self, data: &Value) -> Res<Value> {
+        let data = &lanes_of_clips(data);
         let mut lanes = Vec::new();
         for (n, lane) in data["lanes"].as_array().cloned().unwrap_or_default().iter().take(ARRANGE_MAX_LANES).enumerate() {
             let mut clips = Vec::new();
@@ -1448,7 +1481,7 @@ impl Library {
         let cached = self.map.lock().unwrap().clone();
         match cached {
             Some((v, m)) if v == version => m,
-            Some((_, m)) => {
+            Some((_, m)) if m.as_array().is_some_and(|a| !a.is_empty()) => {
                 if !self.map_busy.swap(true, Ordering::SeqCst) {
                     let me = self.clone();
                     std::thread::spawn(move || {
@@ -1459,7 +1492,7 @@ impl Library {
                 let s = self.store.read().unwrap();
                 Value::Array(m.as_array().unwrap().iter().filter(|p| p["path"].as_str().is_some_and(|x| s.pos.contains_key(x))).cloned().collect())
             }
-            None => self.build_map(),
+            _ => self.build_map(),
         }
     }
 
@@ -1861,6 +1894,34 @@ impl Library {
     }
 }
 
+/// An arrangement kept from when each lane was one sound placed several times, as it is now:
+/// named lanes holding clips. Each old lane becomes a lane named after its sound.
+fn lanes_of_clips(data: &Value) -> Value {
+    let old = data["lanes"].as_array().cloned().unwrap_or_default();
+    if old.iter().all(|l| l.get("clips").is_some()) {
+        return data.clone();
+    }
+    let lanes: Vec<Value> = old
+        .iter()
+        .map(|lane| {
+            if lane.get("clips").is_some() {
+                return lane.clone();
+            }
+            let name = lane["name"].as_str().unwrap_or("");
+            let stem = Path::new(name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let clips: Vec<Value> = lane["hits"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|at| json!({"path": lane["path"], "name": name, "duration": lane["duration"].as_f64().unwrap_or(0.0), "sr": lane["sr"].as_i64().unwrap_or(0), "at": at, "in": 0.0, "out": 0.0}))
+                .collect();
+            json!({"name": stem, "gain": lane["gain"].as_f64().unwrap_or(0.0), "mute": lane["mute"].as_bool().unwrap_or(false), "solo": lane["solo"].as_bool().unwrap_or(false), "clips": clips})
+        })
+        .collect();
+    json!({"loop": data["loop"].as_bool().unwrap_or(true), "lanes": lanes})
+}
+
 /// A file-naming pattern as Python's str.format would read it, with the keys project, category,
 /// n and name; n takes a width such as {n:03d}.
 pub fn fill_pattern(pattern: &str, project: &str, category: &str, n: usize, name: &str) -> Res<String> {
@@ -2024,6 +2085,22 @@ impl Library {
         let text = std::fs::read_to_string(expand(file)).map_err(|e| format!("That file could not be read as a backup: {e}"))?;
         let data: Value = serde_json::from_str(&text).map_err(|e| format!("That file could not be read as a backup: {e}"))?;
         let cat = data["catalog"].as_array().ok_or("That file is not an Athar backup")?;
+        let damaged = |why: &str| format!("That backup is damaged, so nothing was restored: {why}");
+        let rows = |key: &str| -> Res<Vec<Value>> {
+            match &data[key] {
+                Value::Null => Ok(vec![]),
+                Value::Array(a) if a.iter().all(Value::is_object) => Ok(a.clone()),
+                _ => Err(damaged(&format!("{key} must be a list of records"))),
+            }
+        };
+        rows("catalog")?;
+        let (items, project_rows, region_rows) = (rows("project_items")?, rows("projects")?, rows("regions")?);
+        if items.iter().any(|it| !it["project_id"].is_i64() || !it["path"].is_string()) {
+            return Err(damaged("a project item has no project or path"));
+        }
+        if project_rows.iter().any(|p| p.get("paths").is_some_and(|x| !x.is_array())) {
+            return Err(damaged("a project's paths are not a list"));
+        }
         let mut sounds = Vec::new();
         for r in cat {
             let tags: Vec<String> = match &r["tags"] {
@@ -2044,7 +2121,7 @@ impl Library {
         }
         let mut members: HashMap<i64, Vec<(f64, String)>> = HashMap::new();
         let mut dated_pads: HashMap<i64, HashMap<String, i64>> = HashMap::new();
-        for it in data["project_items"].as_array().cloned().unwrap_or_default() {
+        for it in items {
             let pid = it["project_id"].as_i64().unwrap_or(-1);
             let path = it["path"].as_str().unwrap_or("").to_string();
             members.entry(pid).or_default().push((it["added"].as_f64().unwrap_or(0.0), path.clone()));
@@ -2053,7 +2130,7 @@ impl Library {
             }
         }
         let mut projects = Vec::new();
-        for p in data["projects"].as_array().cloned().unwrap_or_default() {
+        for p in project_rows {
             let name = p["name"].as_str().unwrap_or("").trim().to_string();
             if name.is_empty() {
                 continue;
@@ -2072,10 +2149,7 @@ impl Library {
             let pads: HashMap<String, i64> = pads.into_iter().filter(|(_, n)| (0..SP404_PADS).contains(n)).collect();
             projects.push((name, p["folder"].as_str().map(String::from), paths, pads));
         }
-        let regions: Vec<(String, String)> = data["regions"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
+        let regions: Vec<(String, String)> = region_rows
             .iter()
             .filter_map(|r| Some((r["path"].as_str()?.to_string(), if r["data"].is_string() { r["data"].as_str()?.to_string() } else { r["data"].to_string() })))
             .collect();
@@ -2188,3 +2262,7 @@ fn prepare(folder: &str, p: &str) -> Prepared {
         Err(e) => Prepared::Failed(FileRow { error: Some(e), ..base }),
     }
 }
+
+#[cfg(test)]
+#[path = "library_tests.rs"]
+mod tests;

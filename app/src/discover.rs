@@ -358,5 +358,16 @@ mod tests {
     fn licence_names() {
         assert_eq!(super::cc("https://creativecommons.org/licenses/by-nc/4.0/"), "CC BY-NC 4.0");
         assert_eq!(super::cc("http://creativecommons.org/publicdomain/zero/1.0/"), "CC0");
+        assert_eq!(super::cc("https://example.com/terms"), "");
+    }
+
+    #[test]
+    fn requests_athar_cannot_make_are_refused_before_going_online() {
+        assert!(super::download("https://example.com/a.mp3", &std::env::temp_dir(), "a", &|_, _| {}).is_err());
+        assert!(super::download("file:///etc/passwd", &std::env::temp_dir(), "a", &|_, _| {}).is_err());
+        assert_eq!(super::search("openverse", "   ", 1, "").unwrap(), serde_json::json!({"items": [], "more": false}));
+        assert!(super::search("nowhere", "bell", 1, "").is_err());
+        assert!(super::search("freesound", "bell", 1, "").is_err());
+        assert_eq!(super::waveform("../../etc/passwd", 10), serde_json::json!([]));
     }
 }

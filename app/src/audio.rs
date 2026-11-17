@@ -34,7 +34,13 @@ fn wav_bytes(channels: &[Vec<f32>], sr: u32, bits16: bool) -> Result<Vec<u8>, St
 }
 
 pub fn sp404_card() -> Option<String> {
-    let mut cards: Vec<String> = std::fs::read_dir("/Volumes")
+    sp404_card_in(Path::new("/Volumes"))
+}
+
+/// A card the SP-404MKII has formatted holds IMPORT and EXPORT at its root; one named for the
+/// SP-404 wins when several are mounted.
+pub fn sp404_card_in(volumes: &Path) -> Option<String> {
+    let mut cards: Vec<String> = std::fs::read_dir(volumes)
         .ok()?
         .flatten()
         .map(|e| e.path())

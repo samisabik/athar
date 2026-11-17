@@ -73,7 +73,8 @@ pub fn tsne(x: &[Vec<f32>], init: &[[f64; 2]], perplexity: f64, iters: usize) ->
     for it in 0..iters {
         let exag = if it < 250 { 12.0 } else { 1.0 };
         let mom = if it < 250 { 0.5 } else { 0.8 };
-        let z: f64 = y.par_iter().enumerate().map(|(i, yi)| y.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, yj)| 1.0 / (1.0 + (yi[0] - yj[0]).powi(2) + (yi[1] - yj[1]).powi(2))).sum::<f64>()).sum();
+        // Summed in order, so the same sounds always give the same map.
+        let z: f64 = y.par_iter().enumerate().map(|(i, yi)| y.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, yj)| 1.0 / (1.0 + (yi[0] - yj[0]).powi(2) + (yi[1] - yj[1]).powi(2))).sum::<f64>()).collect::<Vec<f64>>().iter().sum();
         let grad: Vec<[f64; 2]> = (0..n)
             .into_par_iter()
             .map(|i| {

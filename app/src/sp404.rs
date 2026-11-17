@@ -161,6 +161,21 @@ pub fn padconf_name(data: &[u8]) -> Option<String> {
     Some(String::from_utf8_lossy(&raw[..end]).trim().to_string())
 }
 
+/// Each used pad's SMP size and label, read back from a PADCONF.BIN.
+#[cfg(test)]
+pub fn pad_labels(data: &[u8]) -> BTreeMap<usize, (usize, String)> {
+    let word = |at: usize| i32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    (0..PADS)
+        .filter_map(|pad| {
+            let size = word(RECORDS + pad * RECORD_WORDS * 4 + SIZE * 4);
+            let n = NAMES + pad * NAME_LEN;
+            let raw = &data[n..n + NAME_LEN - 1];
+            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            (size > 0).then(|| (pad, (size as usize, String::from_utf8_lossy(&raw[..end]).to_string())))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
