@@ -3,9 +3,8 @@
 
 use crate::embed::Error;
 use crate::features::{SECONDS, SR};
-use soxr::format::Mono;
-use soxr::params::{QualityRecipe, QualitySpec, RuntimeSpec};
-use soxr::Soxr;
+use rubato::audioadapter_buffers::owned::InterleavedOwned;
+use rubato::{Fft, FixedSync, Resampler, WindowFunction};
 use std::fs::File;
 use std::path::Path;
 use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -43,13 +42,34 @@ impl Decoded {
     }
 }
 
+/// Any sound file as samples: symphonia first, then macOS's afconvert for whatever symphonia
+/// cannot read (WavPack, some FLAC and AIFF variants), as the Python engine does.
 pub fn decode(path: &Path) -> Result<Decoded, Error> {
+    match decode_native(path) {
+        Ok(d) => Ok(d),
+        Err(first) => {
+            let tmp = std::env::temp_dir().join(format!("athar-{}-{}.wav", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+            let ok = std::process::Command::new("afconvert")
+                .args(["-f", "WAVE", "-d", "LEF32"])
+                .arg(path)
+                .arg(&tmp)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            let out = if ok { decode_native(&tmp) } else { Err(first) };
+            let _ = std::fs::remove_file(&tmp);
+            out
+        }
+    }
+}
+
+fn decode_native(path: &Path) -> Result<Decoded, Error> {
     let mss = MediaSourceStream::new(Box::new(File::open(path)?), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
-    let mut format = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())?;
+    let mut format = symphonia::default::get_probe().probe(&hint, mss, FormatOptions::default(), MetadataOptions::default()).map_err(|e| format!("reading the container: {e}"))?;
     let track = format.default_track(TrackType::Audio).ok_or("no audio track")?;
     let params = track.codec_params.as_ref().and_then(|p| p.audio()).ok_or("no audio parameters")?;
     let mut decoder = symphonia::default::get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default())?;
@@ -57,7 +77,14 @@ pub fn decode(path: &Path) -> Result<Decoded, Error> {
     let mut interleaved: Vec<f32> = Vec::new();
     let mut buf: Vec<f32> = Vec::new();
     let (mut sr, mut nch) = (0u32, 0usize);
-    while let Some(packet) = format.next_packet()? {
+    loop {
+        let packet = match format.next_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            // Some streams end with an end-of-file error instead of a clean end.
+            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("reading a packet: {e}").into()),
+        };
         if packet.track_id != track_id {
             continue;
         }
@@ -70,7 +97,8 @@ pub fn decode(path: &Path) -> Result<Decoded, Error> {
                 interleaved.extend_from_slice(&buf);
             }
             Err(SymError::DecodeError(_)) => continue,
-            Err(e) => return Err(e.into()),
+            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(format!("decoding: {e}").into()),
         }
     }
     if nch == 0 {
@@ -80,32 +108,34 @@ pub fn decode(path: &Path) -> Result<Decoded, Error> {
     Ok(Decoded { channels, sr })
 }
 
-fn sox(e: soxr::Error) -> Error {
+fn resampling(e: impl std::fmt::Debug) -> Error {
     format!("resampling failed: {e:?}").into()
 }
 
-/// libsoxr at its high quality setting, as librosa's default "soxr_hq", trimmed or padded to
-/// ceil(len * to / from) samples as librosa does.
+/// Fixed-ratio FFT resampling with rubato, trimmed or padded to ceil(len * to / from) samples as
+/// librosa does.
 pub fn resample(y: &[f32], from: u32, to: u32) -> Result<Vec<f32>, Error> {
     if from == to {
         return Ok(y.to_vec());
     }
-    // Same arithmetic as librosa (n * ratio, with the ratio rounded first), including its
-    // floating-point round-ups: 26460 samples at 44.1 kHz become 28801 at 48 kHz.
     let want = (y.len() as f64 * (to as f64 / from as f64)).ceil() as usize;
-    let mut s = Soxr::<Mono<f32>>::new_with_params(from as f64, to as f64, QualitySpec::new(QualityRecipe::high()), RuntimeSpec::default()).map_err(sox)?;
-    let mut out = vec![0.0f32; want + 1024];
-    let done = s.process(y, &mut out).map_err(sox)?;
-    let mut n = done.output_frames;
-    loop {
-        let more = s.drain(&mut out[n..]).map_err(sox)?;
-        if more == 0 || n + more >= out.len() {
-            n += more;
-            break;
-        }
-        n += more;
+    if y.is_empty() {
+        return Ok(Vec::new());
     }
-    out.truncate(n);
+    let (from, to) = (from as usize, to as usize);
+    let (mut gcd, mut b) = (from, to);
+    while b != 0 {
+        (gcd, b) = (b, gcd % b);
+    }
+    // FFT blocks of about 300 frames at the lower rate, in an even number of the smallest blocks
+    // the ratio allows so that the filter delay is a whole number of frames at both rates. A
+    // block this size cuts off near 95% of the lower Nyquist, close to soxr's high quality filter.
+    let low = from.min(to) / gcd;
+    let chunk = ((300.0 / low as f64 / 2.0).round() as usize).max(1) * 2 * low;
+    let fixed = if from < to { FixedSync::Input } else { FixedSync::Output };
+    let mut r = Fft::<f64>::new_custom(from, to, chunk, 1, 1, WindowFunction::BlackmanHarris2, fixed).map_err(resampling)?;
+    let input = InterleavedOwned::new_from(y.iter().map(|&v| v as f64).collect(), 1, y.len()).map_err(resampling)?;
+    let mut out: Vec<f32> = r.process_all(&input, y.len(), None).map_err(resampling)?.take_data().into_iter().map(|v| v as f32).collect();
     out.resize(want, 0.0);
     Ok(out)
 }

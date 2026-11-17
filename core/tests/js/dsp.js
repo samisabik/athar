@@ -1,3 +1,5 @@
+// The JS audio processing the Rust port (core/src/dsp.rs) is checked against, kept for its
+// tests (dsp.test.mjs, ../dsp_parity.rs).
 // Signal processing with no DOM or AudioContext, so it runs on the page and in worker.js alike.
 
 /** Average of all channels. A single channel is returned as is, not copied. */

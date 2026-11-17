@@ -26,8 +26,16 @@ fn environment() -> Result<&'static Environment, Error> {
     Ok(ENV.get_or_init(|| env))
 }
 
+/// Audio clips embedded at once: one model session each, two threads per session. One session
+/// gains little from more threads, so several run side by side; they share their packed weights.
+/// Measured on a 10-core Mac: 3 sessions index as fast as 5, in a third of the memory.
+pub fn default_pool() -> usize {
+    (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).clamp(1, 3)
+}
+
 pub struct Clap {
-    audio: Mutex<Session>,
+    audio: Vec<Mutex<Session>>,
+    next: std::sync::atomic::AtomicUsize,
     text: Mutex<Session>,
     tokenizer: Tokenizer,
 }
@@ -39,30 +47,57 @@ fn normalize(mut v: Vec<f32>) -> Vec<f32> {
 }
 
 impl Clap {
-    /// Loads audio.onnx, text.onnx and tokenizer.json from `dir`.
+    /// Loads audio.onnx, text.onnx and tokenizer.json from `dir`, with default_pool() audio sessions.
     pub fn load(dir: &Path) -> Result<Self, Error> {
+        Self::load_with(dir, default_pool())
+    }
+
+    pub fn load_with(dir: &Path, pool: usize) -> Result<Self, Error> {
         let env = environment()?;
         // CPU only, as in the Python engine. On macOS ort otherwise adds the CoreML provider on
         // its own, and that fails on the text model.
         let cpu = || -> Result<_, Error> {
             Session::builder(env)?.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(msg)?.with_execution_providers([ep::CPU::default().build()]).map_err(msg)
         };
-        let audio = cpu()?.with_intra_threads(2).map_err(msg)?.commit_from_file(dir.join("audio.onnx")).map_err(msg)?;
+        let packed = ort::session::builder::PrepackedWeights::new();
+        let audio = (0..pool.max(1))
+            .map(|_| -> Result<Session, Error> {
+                cpu()?
+                    .with_intra_threads(2)
+                    .map_err(msg)?
+                    .with_prepacked_weights(&packed)
+                    .map_err(msg)?
+                    .commit_from_file(dir.join("audio.onnx"))
+                    .map_err(msg)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(Mutex::new)
+            .collect();
         let text = cpu()?.commit_from_file(dir.join("text.onnx")).map_err(msg)?;
         let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let pad_id = tokenizer.token_to_id("<pad>").ok_or("tokenizer has no <pad> token")?;
         tokenizer.with_padding(Some(PaddingParams { pad_id, pad_token: "<pad>".into(), ..Default::default() }));
         tokenizer.with_truncation(Some(TruncationParams { max_length: 512, ..Default::default() }))?;
-        Ok(Self { audio: Mutex::new(audio), text: Mutex::new(text), tokenizer })
+        Ok(Self { audio, next: Default::default(), text: Mutex::new(text), tokenizer })
     }
 
     /// One unit-length vector per clip of 48 kHz mono audio.
     pub fn embed_clip(&self, clip: &[f32]) -> Result<Vec<f32>, Error> {
         let input = Tensor::from_array(([1usize, 1, FRAMES, N_MELS], clap_features(clip)))?;
-        let mut session = self.audio.lock().unwrap();
+        // A free session if there is one, otherwise wait for the next in turn.
+        let mut session = self
+            .audio
+            .iter()
+            .find_map(|s| s.try_lock().ok())
+            .unwrap_or_else(|| self.audio[self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.audio.len()].lock().unwrap());
         let out = session.run(ort::inputs!["input_features" => input])?;
         let (_, data) = out[0].try_extract_tensor::<f32>()?;
         Ok(normalize(data.to_vec()))
+    }
+
+    pub fn pool(&self) -> usize {
+        self.audio.len()
     }
 
     /// A sound made of several clips is the normalized mean of their vectors.

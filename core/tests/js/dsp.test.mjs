@@ -1,7 +1,7 @@
 // Run: node --test tests/
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeWav, resample, spectrogram, spectrogramPeak } from '../athar/static/dsp.js';
+import { encodeWav, resample, spectrogram, spectrogramPeak } from './dsp.js';
 
 const sine = (n, hz, sr, amp = 1) => Float32Array.from({ length: n }, (_, i) => amp * Math.sin(2 * Math.PI * hz * i / sr));
 const rms = (d) => Math.sqrt(d.reduce((a, v) => a + v * v, 0) / d.length);
@@ -41,7 +41,7 @@ test('spectrogram tiles of one sound share a colour scale and join without a sea
   assert.ok(whole.reduce((a, v) => Math.max(a, v), 0) > 200, 'the tone reaches the bright end of the scale');
 });
 
-import { fft, denoise, estimateProfile } from '../athar/static/dsp.js';
+import { fft, denoise, estimateProfile } from './dsp.js';
 
 test('fft matches a direct transform', () => {
   const n = 64, x = Float32Array.from({ length: n }, (_, i) => Math.sin(i * .37) + .5 * Math.cos(i * 1.3));
@@ -69,7 +69,7 @@ test('noise reduction lowers the noise and keeps the tone', () => {
   assert.ok(Math.abs(rms(out.subarray(4096, -4096)) - rms(tone)) < .01);
 });
 
-import { loudness, measure, maximize, stretch, stretchPitch, onsets, declick, loopCrossfade, prep } from '../athar/static/dsp.js';
+import { loudness, measure, maximize, stretch, stretchPitch, onsets, declick, loopCrossfade, prep } from './dsp.js';
 
 const noise = (n, amp, seed = 3) => { let s = seed; return Float32Array.from({ length: n }, () => { s = (s * 1664525 + 1013904223) >>> 0; return (s / 4294967296 - .5) * 2 * amp; }); };
 // The strongest frequency in a signal, by counting zero crossings.
@@ -148,7 +148,7 @@ test('prep trims silence, removes DC, normalizes and fades the edges', () => {
 });
 
 test('pitch detection names the held note of a sine and of an 808 with a pitch drop', async () => {
-  const { detectPitch, noteAt } = await import('../athar/static/dsp.js');
+  const { detectPitch, noteAt } = await import('./dsp.js');
   const sr = 48000, sine = Float32Array.from({ length: sr }, (_, i) => 0.5 * Math.sin(2 * Math.PI * 55 * i / sr));
   assert.equal(noteAt(detectPitch(sine, sr)).name, 'A1');
   const k = new Float32Array(sr); let ph = 0;
@@ -159,7 +159,7 @@ test('pitch detection names the held note of a sine and of an 808 with a pitch d
 });
 
 test('saturation at full mix stays under its ceiling and leaves quiet sound alone at no drive', async () => {
-  const { saturate } = await import('../athar/static/dsp.js');
+  const { saturate } = await import('./dsp.js');
   const sr = 48000, tone = (amp) => Float32Array.from({ length: sr / 2 }, (_, i) => amp * Math.sin(2 * Math.PI * 60 * i / sr));
   const peak = (d) => d.subarray(2000, d.length - 2000).reduce((m, v) => Math.max(m, Math.abs(v)), 0);
   const ceiling = Math.pow(10, -1 / 20);
@@ -168,7 +168,7 @@ test('saturation at full mix stays under its ceiling and leaves quiet sound alon
 });
 
 test('shape changes the hit and the tail on their own', async () => {
-  const { shape } = await import('../athar/static/dsp.js');
+  const { shape } = await import('./dsp.js');
   const sr = 48000, hit = new Float32Array(sr);
   for (let i = 4800; i < sr; i++) { const t = i / sr; hit[i] = 0.8 * Math.sin(2 * Math.PI * 180 * t) * Math.exp(-(t - 0.1) * 6); }
   const rms = (d, a, b) => { let s = 0; for (let i = a; i < b; i++) s += d[i] * d[i]; return Math.sqrt(s / (b - a)); };
@@ -179,7 +179,7 @@ test('shape changes the hit and the tail on their own', async () => {
 });
 
 test('lo-fi at full rate and 24 bits returns the sound unchanged, and holds samples at a lower rate', async () => {
-  const { lofi } = await import('../athar/static/dsp.js');
+  const { lofi } = await import('./dsp.js');
   const sr = 48000, d = Float32Array.from({ length: 4800 }, (_, i) => 0.5 * Math.sin(2 * Math.PI * 440 * i / sr));
   assert.deepEqual(lofi([d], sr, { bits: 24, rate: 48 }).channels[0], d);
   const o = lofi([d], sr, { bits: 24, rate: 8 }).channels[0];

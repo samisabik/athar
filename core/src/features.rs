@@ -27,29 +27,32 @@ fn mel_to_hz(m: f64) -> f64 {
     if m >= 15.0 { 1000.0 * (logstep * (m - 15.0)).exp() } else { f_sp * m }
 }
 
-/// librosa.filters.mel(sr=48000, n_fft=1024, n_mels=64, fmin=50, fmax=14000, htk=False,
-/// norm="slaney"), rounded to f32 as librosa stores it. Shape: N_MELS rows of N_FFT/2+1.
+/// librosa.filters.mel(htk=False, norm="slaney"), rounded to f32 as librosa stores it: n_mels
+/// rows of n_fft/2+1 weights.
+pub fn mel(sr: f64, n_fft: usize, n_mels: usize, fmin: f64, fmax: f64) -> Vec<Vec<f64>> {
+    let bins = n_fft / 2 + 1;
+    let fft_freqs: Vec<f64> = (0..bins).map(|k| k as f64 * (sr / 2.0) / (bins - 1) as f64).collect();
+    let (lo, hi) = (hz_to_mel(fmin), hz_to_mel(fmax));
+    let mel_f: Vec<f64> = (0..n_mels + 2).map(|i| mel_to_hz(lo + (hi - lo) * i as f64 / (n_mels + 1) as f64)).collect();
+    (0..n_mels)
+        .map(|i| {
+            let enorm = 2.0 / (mel_f[i + 2] - mel_f[i]);
+            fft_freqs
+                .iter()
+                .map(|&f| {
+                    let lower = (f - mel_f[i]) / (mel_f[i + 1] - mel_f[i]);
+                    let upper = (mel_f[i + 2] - f) / (mel_f[i + 2] - mel_f[i + 1]);
+                    ((lower.min(upper).max(0.0) * enorm) as f32) as f64
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// CLAP's filterbank: 48 kHz, 1024-point FFT, 64 bands from 50 Hz to 14 kHz.
 pub fn mel_filters() -> &'static Vec<Vec<f64>> {
     static MEL: OnceLock<Vec<Vec<f64>>> = OnceLock::new();
-    MEL.get_or_init(|| {
-        let bins = N_FFT / 2 + 1;
-        let fft_freqs: Vec<f64> = (0..bins).map(|k| k as f64 * (SR as f64 / 2.0) / (bins - 1) as f64).collect();
-        let (lo, hi) = (hz_to_mel(FMIN), hz_to_mel(FMAX));
-        let mel_f: Vec<f64> = (0..N_MELS + 2).map(|i| mel_to_hz(lo + (hi - lo) * i as f64 / (N_MELS + 1) as f64)).collect();
-        (0..N_MELS)
-            .map(|i| {
-                let enorm = 2.0 / (mel_f[i + 2] - mel_f[i]);
-                fft_freqs
-                    .iter()
-                    .map(|&f| {
-                        let lower = (f - mel_f[i]) / (mel_f[i + 1] - mel_f[i]);
-                        let upper = (mel_f[i + 2] - f) / (mel_f[i + 2] - mel_f[i + 1]);
-                        ((lower.min(upper).max(0.0) * enorm) as f32) as f64
-                    })
-                    .collect()
-            })
-            .collect()
-    })
+    MEL.get_or_init(|| mel(SR as f64, N_FFT, N_MELS, FMIN, FMAX))
 }
 
 /// The model input for one clip of 48 kHz mono audio: FRAMES rows of N_MELS values.
