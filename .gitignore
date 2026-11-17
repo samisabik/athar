@@ -1,10 +1,11 @@
-.venv/
-build/
+# Local leftovers of the retired Python app (old builds, its environment).
 dist/
-__pycache__/
-*.pyc
+.venv/
+
+build/
 .DS_Store
-.pytest_cache/
-*.egg-info/
 .claude/
-.ruff_cache/
+
+core/target/
+app/target/
+node_modules/

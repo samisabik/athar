@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Athar</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <nav id="activity">
+    <svg class="logo" viewBox="-105 -1038 960 1318" aria-hidden="true"><path fill="#7a3dff" style="fill: var(--accent)" transform="translate(50 50)" d="M174 0V-140H320V0ZM-85 150Q-41 162 -12.5 159.0Q16 156 32.0 142.0Q48 128 54.0 106.5Q60 85 60 60V-309L200 -340V60Q200 113 177.5 146.5Q155 180 119.0 195.5Q83 211 43.5 210.0Q4 209 -30.5 193.5Q-65 178 -85 150ZM383 -615Q359 -615 342.0 -632.0Q325 -649 325 -673Q325 -697 342.0 -714.0Q359 -731 383 -731Q407 -731 424.0 -714.0Q441 -697 441 -673Q441 -649 424.0 -632.0Q407 -615 383 -615ZM469 -465Q445 -465 428.0 -482.0Q411 -499 411 -523Q411 -547 428.0 -564.0Q445 -581 469 -581Q493 -581 510.0 -564.0Q527 -547 527 -523Q527 -499 510.0 -482.0Q493 -465 469 -465ZM296 -465Q272 -465 255.0 -482.0Q238 -499 238 -523Q238 -547 255.0 -564.0Q272 -581 296 -581Q320 -581 337.0 -564.0Q354 -547 354 -523Q354 -499 337.0 -482.0Q320 -465 296 -465ZM280 0V-140H360V-309L500 -340V-23Q500 -11 490.0 -6.0Q480 -1 470.0 -0.5Q460 0 460 0ZM573 -859V-892Q573 -911 574.0 -922.5Q575 -934 579 -949Q587 -979 606.0 -998.5Q625 -1018 664 -1018Q678 -1018 697.5 -1009.5Q717 -1001 727 -978Q721 -981 701.0 -986.0Q681 -991 667 -987Q651 -983 644.0 -972.5Q637 -962 636.0 -952.5Q635 -943 635 -939Q635 -919 645.5 -911.0Q656 -903 670.5 -901.5Q685 -900 697 -900H723L724 -859ZM500 -850 530 -900H770L740 -850ZM785 -58Q779 -36 753.5 -19.5Q728 -3 693.5 3.0Q659 9 626.5 1.5Q594 -6 572.0 -30.5Q550 -55 550 -100V-769L690 -800V-100Q690 -75 701.0 -63.5Q712 -52 728.0 -49.5Q744 -47 760.0 -50.5Q776 -54 785 -58Z"/><path fill="#fbfbfa" d="M174 0V-140H320V0ZM-85 150Q-41 162 -12.5 159.0Q16 156 32.0 142.0Q48 128 54.0 106.5Q60 85 60 60V-309L200 -340V60Q200 113 177.5 146.5Q155 180 119.0 195.5Q83 211 43.5 210.0Q4 209 -30.5 193.5Q-65 178 -85 150ZM383 -615Q359 -615 342.0 -632.0Q325 -649 325 -673Q325 -697 342.0 -714.0Q359 -731 383 -731Q407 -731 424.0 -714.0Q441 -697 441 -673Q441 -649 424.0 -632.0Q407 -615 383 -615ZM469 -465Q445 -465 428.0 -482.0Q411 -499 411 -523Q411 -547 428.0 -564.0Q445 -581 469 -581Q493 -581 510.0 -564.0Q527 -547 527 -523Q527 -499 510.0 -482.0Q493 -465 469 -465ZM296 -465Q272 -465 255.0 -482.0Q238 -499 238 -523Q238 -547 255.0 -564.0Q272 -581 296 -581Q320 -581 337.0 -564.0Q354 -547 354 -523Q354 -499 337.0 -482.0Q320 -465 296 -465ZM280 0V-140H360V-309L500 -340V-23Q500 -11 490.0 -6.0Q480 -1 470.0 -0.5Q460 0 460 0ZM573 -859V-892Q573 -911 574.0 -922.5Q575 -934 579 -949Q587 -979 606.0 -998.5Q625 -1018 664 -1018Q678 -1018 697.5 -1009.5Q717 -1001 727 -978Q721 -981 701.0 -986.0Q681 -991 667 -987Q651 -983 644.0 -972.5Q637 -962 636.0 -952.5Q635 -943 635 -939Q635 -919 645.5 -911.0Q656 -903 670.5 -901.5Q685 -900 697 -900H723L724 -859ZM500 -850 530 -900H770L740 -850ZM785 -58Q779 -36 753.5 -19.5Q728 -3 693.5 3.0Q659 9 626.5 1.5Q594 -6 572.0 -30.5Q550 -55 550 -100V-769L690 -800V-100Q690 -75 701.0 -63.5Q712 -52 728.0 -49.5Q744 -47 760.0 -50.5Q776 -54 785 -58Z"/></svg>
+    <button class="ab" data-view="sounds" data-tip="Library" aria-label="Library"><span class="i">queue_music</span></button>
+    <button class="ab" data-view="discover" data-tip="Discover" aria-label="Discover"><span class="i">travel_explore</span></button>
+    <button class="ab" data-view="projects" data-tip="Projects" aria-label="Projects"><span class="i">category</span></button>
+    <button class="ab" data-view="arranger" data-tip="Arranger" aria-label="Arranger"><span class="i">view_timeline</span></button>
+    <button class="ab" data-view="editor" data-tip="Editor" aria-label="Editor"><span class="i">graphic_eq</span></button>
+    <button class="ab" data-view="recorder" data-tip="Recorder" aria-label="Recorder"><span class="i">mic</span></button>
+    <button class="ab" data-view="map" data-tip="Map" aria-label="Map"><span class="i">bubble_chart</span></button>
+    <span class="spacer"></span>
+    <button class="ab" data-view="settings" data-tip="Settings" aria-label="Settings"><span class="i">settings</span></button>
+  </nav>
+
+  <main>
+    <div class="transport">
+      <div class="vol" id="knob" role="slider" tabindex="0" aria-label="Volume" aria-valuemin="0" aria-valuemax="100" aria-valuenow="80" data-tip="Volume">80</div>
+    </div>
+    <section class="view" data-view="sounds">
+      <div class="vhead"><h1>Library</h1></div>
+      <header id="top">
+        <div class="hello" id="hello" aria-hidden="true"></div>
+        <div class="searchbar">
+          <span class="i lead">search</span>
+          <input id="q" placeholder="Describe a sound" spellcheck="false" autocomplete="off" aria-label="Search sounds">
+          <button class="ib" id="filterBtn" data-tip="Filters" aria-expanded="false" aria-controls="filters"><span class="i">tune</span><span class="badge" id="filterCount" hidden></span></button>
+        </div>
+        <span class="lib-folders under"><span class="i">folder_copy</span><button type="button" class="linkbtn" data-folders="list" data-tip="See the folders the Library reads">Library folders</button><span aria-hidden="true">·</span><button type="button" class="linkbtn" data-folders="add" data-tip="Add a folder of samples to the Library">Add folder</button></span>
+        <div class="filters" id="filters" hidden>
+          <label class="f"><span>Sound</span><select id="catFilter"><option value="">any</option></select></label>
+          <label class="f"><span>Tag</span><select id="tagFilter"><option value="">any</option></select></label>
+          <label class="f"><span>Rating</span><select id="ratingFilter"><option value="">any</option><option value="1">1+</option><option value="2">2+</option><option value="3">3+</option><option value="4">4+</option><option value="5">5</option></select></label>
+        </div>
+        <div class="scope-row"><span id="scope" class="scope"></span><span id="chips" class="chip-row" hidden></span><span id="markBar" class="markbar" hidden></span>
+          <span class="spacer"></span>
+          <span class="lib-folders"><button type="button" class="linkbtn" data-folders="list" data-tip="See the folders the Library reads, or add one">Library folders</button></span>
+          <button class="ib" id="batchBtn" data-tip="Batch: prep or convert every sound in this list"><span class="i">dynamic_feed</span></button>
+          <label class="f" hidden><select id="sort" aria-label="Sort">
+            <option value="score">best match</option><option value="name">name</option><option value="duration">length</option><option value="category">type</option>
+            <option value="rating">highest rated</option><option value="recorded">newest recording</option>
+          </select></label>
+        </div>
+        <div id="subs" class="subs" hidden></div>
+      </header>
+
+      <div class="lib">
+        <div class="card stage" id="card"></div>
+        <div id="results" class="qlist table"></div>
+      </div>
+    </section>
+
+    <section class="view" data-view="folders" hidden>
+      <div class="vhead"><h1>Library folders</h1></div>
+      <div class="cmdline">
+        <button class="ghost" id="foldersBack"><span class="i">arrow_back</span>Library</button>
+        <button class="primary" id="addFolder"><span class="i">create_new_folder</span>Add folder</button>
+        <button class="ghost" id="rescan" data-tip="Look in every folder for new or changed files"><span class="i">refresh</span>Rescan</button>
+      </div>
+      <div class="stack">
+        <div id="folders" class="list big"></div>
+      </div>
+    </section>
+
+    <section class="view" data-view="projects" hidden>
+      <div class="vhead"><h1>Projects</h1></div>
+      <div class="cmdline">
+        <button class="primary" id="newProject"><span class="i">add</span>New project</button>
+        <div id="projectAdd" class="inline-form" hidden>
+          <input id="projectInput" placeholder="Project name" aria-label="Project name">
+          <button class="ib" id="projectOk" data-tip="Create"><span class="i">check</span></button>
+        </div>
+      </div>
+      <div class="stack">
+        <div id="projList" class="list big"></div>
+      </div>
+    </section>
+
+    <section class="view" data-view="editor" hidden>
+      <div class="vhead"><h1>Editor</h1></div>
+      <section id="editor" class="blank">
+        <div class="ed-head">
+          <span class="ed-crumb"><span class="ed-where" data-f="place" hidden></span><strong class="ed-title" data-f="title"></strong></span>
+          <span class="ed-pos" data-f="pos"></span>
+        </div>
+        <div class="toolbar">
+          <button class="ib strong" data-a="play" data-tip="Play / stop (space)"><span class="i">play_arrow</span></button>
+          <button class="ib toggle" data-a="loop" data-tip="Loop selection (L)"><span class="i">repeat</span></button>
+          <span class="sep"></span>
+          <button class="ib" data-a="zoomin" data-tip="Zoom in (+, or cmd + scroll)"><span class="i">zoom_in</span></button>
+          <button class="ib" data-a="zoomout" data-tip="Zoom out (-)"><span class="i">zoom_out</span></button>
+          <button class="ib" data-a="zoomsel" data-tip="Zoom to selection (E)"><span class="i">zoom_in_map</span></button>
+          <button class="ib" data-a="fit" data-tip="Fit whole file (F)"><span class="i">fit_screen</span></button>
+          <button class="ib toggle" data-a="view" data-tip="Spectrogram view"><span class="i">graphic_eq</span></button>
+          <button class="ib toggle" data-a="bars" data-tip="Bars and beats: show a tempo grid and snap selections to it"><span class="i">straighten</span></button>
+          <span class="sep"></span>
+          <button class="ib" data-a="undo" data-tip="Undo (cmd Z)"><span class="i">undo</span></button>
+          <button class="ib" data-a="redo" data-tip="Redo (cmd shift Z)"><span class="i">redo</span></button>
+          <span class="sep"></span>
+          <button class="ib" id="saveBtn" data-a="save" data-tip="Save as a new file, into a project or a folder (cmd S)"><span class="i">save</span></button>
+          <div class="tmenu">
+            <button type="button" class="tmenu-btn" aria-haspopup="menu" aria-expanded="false">File</button>
+            <div class="tmenu-list wide" role="menu" aria-label="File" hidden>
+              <button type="button" role="menuitem" data-a="save"><span class="i">save</span><span class="tm-label">Save as a new file…</span><kbd>cmd S</kbd></button>
+              <button type="button" role="menuitem" data-a="exportregions"><span class="i">splitscreen</span><span class="tm-label">Save each region as its own file</span></button>
+              <button type="button" role="menuitem" data-a="sp404" data-tip="48 kHz 16-bit WAV, saved into the SD card's IMPORT folder"><span class="i">sd_card</span><span class="tm-label">Export for SP-404MKII…</span></button>
+              <button type="button" role="menuitem" data-a="download"><span class="i">download</span><span class="tm-label">Download</span></button>
+              <hr>
+              <div class="tm-fields">
+                <label>Name <input data-f="name" spellcheck="false"></label>
+                <label>Format <select data-f="format"><option value="wav">WAV</option><option value="flac">FLAC</option><option value="mp3">MP3</option></select></label>
+                <label>Sample rate <select data-f="rate">
+                  <option value="0">Original rate</option><option value="48000">48 kHz</option><option value="44100">44.1 kHz</option>
+                  <option value="32000">32 kHz</option><option value="24000">24 kHz</option><option value="22050">22.05 kHz</option><option value="16000">16 kHz</option>
+                </select></label>
+                <label>Bit depth <select data-f="bits"><option value="16">16-bit</option><option value="24" selected>24-bit</option><option value="32">32 float</option></select></label>
+              </div>
+            </div>
+          </div>
+          <div class="tmenu">
+            <button type="button" class="tmenu-btn" aria-haspopup="menu" aria-expanded="false">Edit</button>
+            <div class="tmenu-list" role="menu" aria-label="Edit" hidden>
+              <button type="button" role="menuitem" data-a="all"><span class="i">select_all</span><span class="tm-label">Select all</span><kbd>cmd A</kbd></button>
+              <button type="button" role="menuitem" data-a="snap"><span class="i">align_horizontal_center</span><span class="tm-label">Snap to zero crossings</span></button>
+              <hr>
+              <button type="button" role="menuitem" data-a="trim"><span class="i">crop</span><span class="tm-label">Keep only the selection</span><kbd>cmd T</kbd></button>
+              <button type="button" role="menuitem" data-a="delete"><span class="i">delete</span><span class="tm-label">Delete</span><kbd>backspace</kbd></button>
+              <button type="button" role="menuitem" data-a="cut"><span class="i">content_cut</span><span class="tm-label">Cut</span><kbd>cmd X</kbd></button>
+              <button type="button" role="menuitem" data-a="copy"><span class="i">content_copy</span><span class="tm-label">Copy</span><kbd>cmd C</kbd></button>
+              <button type="button" role="menuitem" data-a="paste"><span class="i">content_paste</span><span class="tm-label">Paste</span><kbd>cmd V</kbd></button>
+              <button type="button" role="menuitem" data-a="silence"><span class="i">volume_off</span><span class="tm-label">Silence</span></button>
+            </div>
+          </div>
+          <div class="tmenu">
+            <button type="button" class="tmenu-btn" aria-haspopup="menu" aria-expanded="false">Level</button>
+            <div class="tmenu-list" role="menu" aria-label="Level" hidden>
+              <button type="button" role="menuitem" data-a="fade"><span class="i">trending_up</span><span class="tm-label">Fade in and out…</span></button>
+              <hr>
+              <button type="button" role="menuitem" data-a="normalize"><span class="i">height</span><span class="tm-label">Normalize peak…</span></button>
+              <button type="button" role="menuitem" data-a="loudnorm"><span class="i">hearing</span><span class="tm-label">Normalize loudness…</span></button>
+              <button type="button" role="menuitem" data-a="gain"><span class="i">volume_up</span><span class="tm-label">Gain…</span></button>
+            </div>
+          </div>
+          <div class="tmenu">
+            <button type="button" class="tmenu-btn" aria-haspopup="menu" aria-expanded="false">Time</button>
+            <div class="tmenu-list" role="menu" aria-label="Time" hidden>
+              <button type="button" role="menuitem" data-a="speed"><span class="i">speed</span><span class="tm-label">Speed…</span></button>
+              <button type="button" role="menuitem" data-a="stretch"><span class="i">expand</span><span class="tm-label">Stretch and pitch…</span></button>
+              <button type="button" role="menuitem" data-a="tune"><span class="i">music_note</span><span class="tm-label">Tune to note…</span></button>
+              <button type="button" role="menuitem" data-a="loopxfade"><span class="i">all_inclusive</span><span class="tm-label">Make it loop…</span></button>
+              <button type="button" role="menuitem" data-a="reverse"><span class="i">swap_horiz</span><span class="tm-label">Reverse</span></button>
+            </div>
+          </div>
+          <div class="tmenu">
+            <button type="button" class="tmenu-btn" aria-haspopup="menu" aria-expanded="false">Repair</button>
+            <div class="tmenu-list" role="menu" aria-label="Repair" hidden>
+              <button type="button" role="menuitem" data-a="declick"><span class="i">healing</span><span class="tm-label">Remove clicks…</span></button>
+              <button type="button" role="menuitem" data-a="trimsilence"><span class="i">unfold_less</span><span class="tm-label">Trim silent ends…</span></button>
+              <hr>
+              <button type="button" role="menuitem" data-a="mono"><span class="i">call_merge</span><span class="tm-label">Mix to mono</span></button>
+            </div>
+          </div>
+          <div class="tmenu">
+            <button type="button" class="tmenu-btn" aria-haspopup="menu" aria-expanded="false">Effects</button>
+            <div class="tmenu-list" role="menu" aria-label="Effects" hidden>
+              <button type="button" role="menuitem" data-fx-open="eq"><span class="i">equalizer</span><span class="tm-label">Parametric EQ</span></button>
+              <button type="button" role="menuitem" data-fx-open="comp"><span class="i">compress</span><span class="tm-label">Compressor</span></button>
+              <button type="button" role="menuitem" data-fx-open="max"><span class="i">vertical_align_top</span><span class="tm-label">Maximizer</span></button>
+              <button type="button" role="menuitem" data-fx-open="sat"><span class="i">local_fire_department</span><span class="tm-label">Saturation</span></button>
+              <button type="button" role="menuitem" data-fx-open="shape"><span class="i">show_chart</span><span class="tm-label">Shape: attack and tail</span></button>
+              <button type="button" role="menuitem" data-fx-open="lofi"><span class="i">grain</span><span class="tm-label">Lo-fi</span></button>
+              <hr>
+              <button type="button" role="menuitem" data-fx-open="nr"><span class="i">noise_control_off</span><span class="tm-label">Noise reduction</span></button>
+            </div>
+          </div>
+          <span class="sep"></span>
+          <button class="ib accent" data-a="prep" data-tip="Sampler prep: remove DC, trim silent ends, normalize, add short fades"><span class="i">auto_fix_high</span></button>
+        </div>
+        <div class="ed-settings" id="edSettings" hidden>
+          <label>Normalize to <input data-f="norm" type="number" value="-1" step="0.5"> dB</label>
+          <label>Gain <input data-f="gain" type="number" value="3" step="0.5"> dB</label>
+          <label>Speed <input data-f="speed" type="number" value="50" step="1"> %</label>
+          <label>Silence below <input data-f="thresh" type="number" value="-45" step="1"> dB</label>
+          <label>Trim below <input data-f="trimthresh" type="number" value="-96" step="1"> dB</label>
+          <label>Slice gap <input data-f="gap" type="number" value="250" step="50"> ms</label>
+          <label>Loudness <input data-f="lufs" type="number" value="-16" step="0.5"> LUFS</label>
+          <label>Length <input data-f="stretchlen" type="number" value="100" step="1" min="25" max="400"> %</label>
+          <label>Pitch <input data-f="semis" type="number" value="0" step="1" min="-24" max="24"> semitones</label>
+          <label>Fade in <input data-f="fadeinlen" type="number" value="0" step="1" min="0"> ms</label>
+          <label>Fade out <input data-f="fadeoutlen" type="number" value="0" step="1" min="0"> ms</label>
+          <label>Shift <input data-f="tunesemis" type="number" value="0" step="0.01"> semitones</label>
+          <label>Crossfade <input data-f="xfade" type="number" value="50" step="10" min="1"> ms</label>
+          <label>Sensitivity <input data-f="clicksens" type="number" value="5" step="1" min="1" max="10"> of 10</label>
+          <label>Sensitivity <input data-f="onsetsens" type="number" value="5" step="1" min="1" max="10"> of 10</label>
+          <label>Tempo <input data-f="bpm" type="number" value="120" step="0.1" min="20" max="400"> BPM</label>
+          <label>Slices per beat <input data-f="perbeat" type="number" value="1" step="1" min="0.25" max="16"></label>
+        </div>
+        <canvas id="wave"></canvas>
+        <div id="fx" hidden>
+          <div class="fx-head">
+            <div class="fx-tabs">
+              <button class="ib" data-fx="eq" data-tip="Parametric EQ"><span class="i">equalizer</span></button>
+              <button class="ib" data-fx="comp" data-tip="Compressor"><span class="i">compress</span></button>
+              <button class="ib" data-fx="max" data-tip="Maximizer"><span class="i">vertical_align_top</span></button>
+              <button class="ib" data-fx="sat" data-tip="Saturation"><span class="i">local_fire_department</span></button>
+              <button class="ib" data-fx="shape" data-tip="Shape: attack and tail"><span class="i">show_chart</span></button>
+              <button class="ib" data-fx="lofi" data-tip="Lo-fi"><span class="i">grain</span></button>
+              <button class="ib" data-fx="nr" data-tip="Noise reduction"><span class="i">noise_control_off</span></button>
+            </div>
+            <div class="fx-tabs" data-x="tooltabs" hidden></div>
+            <strong class="fx-title"></strong>
+            <span class="spacer"></span>
+            <div class="ab-switch" data-x="ab" role="group" aria-label="Compare with the original">
+              <button type="button" data-ab="a" data-tip="Hear and see the sound without this change. The controls stay where they are (B)">Original</button>
+              <button type="button" data-ab="b" data-tip="Hear and see the sound with this change (B)">Edited</button>
+            </div>
+            <button class="ib" data-x="reset" data-tip="Put every control back where it started"><span class="i">restart_alt</span></button>
+            <button class="ib" data-x="close" data-tip="Close"><span class="i">close</span></button>
+          </div>
+          <div class="fx-body"></div>
+          <div class="fx-bar">
+            <span class="spacer"></span>
+            <button type="button" class="ghost" data-x="discard" hidden>Discard</button>
+            <button type="button" class="primary" data-x="apply" data-tip="Keep this change in the selection, or in the whole sound"><span class="i">check</span>Apply</button>
+          </div>
+        </div>
+        <div class="regions-row">
+          <button class="ib" data-a="addregion" data-tip="Add selection as a region (R)"><span class="i">add_box</span></button>
+          <button class="ib" data-a="autoslice" data-tip="Auto-slice at silences"><span class="i">auto_awesome_motion</span></button>
+          <button class="ib" data-a="transients" data-tip="Slice at hits"><span class="i">bolt</span></button>
+          <button class="ib" data-a="gridslice" data-tip="Slice on a tempo grid"><span class="i">grid_on</span></button>
+          <button class="ib" data-a="clearregions" data-tip="Clear regions"><span class="i">delete_outline</span></button>
+          <div data-f="regions" class="regions"></div>
+          <span class="ed-chips" data-f="info"></span>
+        </div>
+      </section>
+    </section>
+
+    <section class="view" data-view="discover" id="discover" hidden>
+      <div class="vhead"><h1>Discover</h1></div>
+      <header class="disc-top"></header>
+      <div class="stack"></div>
+    </section>
+
+    <section class="view" data-view="arranger" id="arranger" hidden>
+      <div class="vhead"><h1>Arranger</h1></div>
+      <div class="cmdline"></div>
+      <div class="stack"></div>
+    </section>
+
+    <section class="view" data-view="recorder" id="recorder" hidden>
+      <div class="vhead"><h1>Recorder</h1></div>
+      <div class="cmdline"></div>
+      <div class="stack"></div>
+    </section>
+
+    <section class="view" data-view="map" id="soundmap" hidden>
+      <div class="vhead"><h1>Map</h1></div>
+      <div class="cmdline"></div>
+      <div class="map-body"></div>
+    </section>
+
+    <section class="view" data-view="settings" hidden>
+      <div class="vhead"><h1>Settings</h1></div>
+      <div class="vbody narrow" id="settingsForm"></div>
+    </section>
+  </main>
+
+</div>
+
+<div id="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <h3 id="modalTitle"></h3>
+    <div id="modalBody"></div>
+    <div class="row end"><button class="ghost" id="modalCancel">Cancel</button><button class="ghost" id="modalAlt" hidden></button><button id="modalOk">OK</button></div>
+  </div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+<div id="indexing" role="status" hidden><span class="spin" aria-hidden="true"></span><span id="indexingText"></span><span class="bar" id="indexingBar" role="progressbar" aria-valuemin="0" aria-valuemax="100" hidden><i></i></span></div>
+<div id="cat" hidden>
+  <div class="cat-bubble" id="catBubble" role="status" hidden>
+    <p id="catText"></p>
+    <div class="cat-acts"><button type="button" id="catNext">Another tip</button><button type="button" class="ib" id="catClose" data-tip="Close" aria-label="Close"><span class="i">close</span></button></div>
+  </div>
+  <span class="cat-meow" id="catMeow" aria-hidden="true" hidden>meow</span>
+  <button type="button" class="cat-btn" id="catBtn" aria-label="Tips from the cat" data-tip="Tips">
+    <canvas id="catCanvas" width="32" height="32" aria-hidden="true"></canvas>
+  </button>
+</div>
+<div id="tip" role="tooltip" hidden></div>
+<script type="module" src="/static/main.js"></script>
+</body>
+</html>

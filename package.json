@@ -1,0 +1,11 @@
+{
+  "name": "athar-interface",
+  "private": true,
+  "description": "Type checks for the interface in app/ui: strict, through JSDoc, with no build step.",
+  "scripts": {
+    "check": "tsc -p jsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3"
+  }
+}
