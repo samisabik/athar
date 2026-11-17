@@ -21,6 +21,8 @@ from watchdog.observers import Observer
 
 from . import engine as eng
 
+# Above nonsense: the best a query must score to count as finding anything, and what each sound keeps.
+QUERY_FOUND, QUERY_KEEP = 0.25, 0.15
 AUDIO_EXTS = {".wav", ".aif", ".aiff", ".flac", ".mp3", ".ogg", ".m4a", ".aac", ".wv"}
 # Files analysed and embedded per step: a multiple of the embedding callers, so they stay busy.
 BATCH = eng.EMBED_CALLERS * 4
@@ -1026,17 +1028,14 @@ class Library:
                     boost[i] = 1.0
                 elif terms:
                     boost[i] = 0.5 * sum(t in hay for t in terms) / len(terms)
-            # CLAP ranks every sound, even for nonsense queries. Keep only sounds that stand
-            # clearly above the rest of the library, plus anything matching by name, tag or note.
-            raw = scores
-            med = float(np.median(raw))
-            if vec is not None and float(raw.max()) - med >= 0.15:
-                relevant = (raw >= med + 0.12) | (boost > 0)
-            else:
-                relevant = boost > 0
-            if vec is not None and float(raw.max()) >= 0.33:
-                # A library of near-identical sounds (all 808s, say) has no spread; keep strong matches anyway.
-                relevant |= raw >= max(0.33, float(raw.max()) - 0.08)
+            # CLAP ranks every sound, even for nonsense queries, and some sounds score high for
+            # any text. Each sound's score for nonsense text is taken off: the query must find
+            # sounds clearly, or only matches by name, tag or note are kept.
+            relevant = boost > 0
+            if vec is not None and self.engine is not None:
+                adj = M @ (vec - self.engine.nonsense)
+                if float(adj.max()) >= QUERY_FOUND:
+                    relevant |= adj >= QUERY_KEEP
             scores = scores + boost
         mask = np.ones(n, bool)
         dur = np.array([m["duration"] or 0 for m in metas])

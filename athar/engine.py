@@ -25,6 +25,9 @@ MAX_CLIPS = 6
 EMBED_THREADS = 2
 EMBED_CALLERS = max(1, (os.cpu_count() or 2) // EMBED_THREADS)
 
+# Text with no meaning, whose scores show which sounds match any text at all.
+NONSENSE = ["xq vlorp", "mmbrrt kazoodle", "fhqwhgads", "plinth snorf wub", "qwertyuiop"]
+
 CATEGORIES = {
     "Kick": "a kick drum hit",
     "Snare": "a snare drum hit",
@@ -280,6 +283,7 @@ class Engine:
         self.lock = threading.Lock()
         self.category_names = list(CATEGORIES)
         self.category_matrix = self.embed_texts(list(CATEGORIES.values()))
+        self.nonsense = self.embed_texts(NONSENSE).mean(axis=0)
 
     @staticmethod
     def _normalize(v):
