@@ -10,7 +10,7 @@ use crate::library::Library;
 use athar_core::dsp;
 use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 type Chs = Vec<Vec<f32>>;
 type R<T> = Result<T, String>;
@@ -64,8 +64,10 @@ struct State {
     views: Vec<(String, Arc<Sound>, usize, Value)>,
     clip: Option<Arc<Sound>>,
     noise: Option<Value>,
-    mono: Option<(usize, Arc<Vec<f32>>, f64)>,
-    pyramids: Vec<(usize, Arc<Vec<(Vec<f32>, Vec<f32>)>>)>,
+    // Kept per sound. A Weak, not an address: a sound freed by an edit can leave its address to
+    // the next one, which must not inherit its drawing.
+    mono: Option<(Weak<Sound>, Arc<Vec<f32>>, f64)>,
+    pyramids: Vec<(Weak<Sound>, Arc<Vec<(Vec<f32>, Vec<f32>)>>)>,
     play: Play,
 }
 
@@ -88,6 +90,11 @@ pub fn shift_regions(regions: &[Region], a: usize, b: usize, n: usize, inner: &d
 fn crop_regions(regions: &[Region], a: usize, b: usize, len: usize) -> Vec<Region> {
     let r = shift_regions(regions, b, len, 0, &|_| b);
     shift_regions(&r, 0, a, 0, &|_| 0)
+}
+
+/// Whether `w` still points at the sound `s`.
+fn same(w: &Weak<Sound>, s: &Arc<Sound>) -> bool {
+    w.upgrade().is_some_and(|x| Arc::ptr_eq(&x, s))
 }
 
 fn ptr(s: &Arc<Sound>) -> usize {
@@ -852,8 +859,7 @@ impl Doc {
     }
 
     fn pyramid(&self, s: &Arc<Sound>) -> Arc<Vec<(Vec<f32>, Vec<f32>)>> {
-        let key = ptr(s);
-        if let Some(p) = self.st.lock().unwrap().pyramids.iter().find(|p| p.0 == key) {
+        if let Some(p) = self.st.lock().unwrap().pyramids.iter().find(|p| same(&p.0, s)) {
             return p.1.clone();
         }
         let p: Arc<Vec<(Vec<f32>, Vec<f32>)>> = Arc::new(
@@ -863,7 +869,8 @@ impl Doc {
                 .collect(),
         );
         let mut st = self.st.lock().unwrap();
-        st.pyramids.push((key, p.clone()));
+        st.pyramids.retain(|p| p.0.strong_count() > 0);
+        st.pyramids.push((Arc::downgrade(s), p.clone()));
         if st.pyramids.len() > 4 {
             st.pyramids.remove(0);
         }
@@ -929,14 +936,13 @@ impl Doc {
     /// One spectrogram tile as RGBA pixels.
     pub fn spectrogram(&self, key: Option<&str>, start: f64, spp: f64, pw: usize, rows: usize) -> R<Vec<u8>> {
         let s = self.src(key)?;
-        let id = ptr(&s);
-        let cached = self.st.lock().unwrap().mono.clone().filter(|m| m.0 == id);
+        let cached = self.st.lock().unwrap().mono.clone().filter(|m| same(&m.0, &s));
         let (_, data, pk) = match cached {
             Some(m) => m,
             None => {
                 let m = Arc::new(mono(&s.channels));
                 let pk = dsp::spectrogram_peak(&m, s.sr);
-                let e = (id, m, pk);
+                let e = (Arc::downgrade(&s), m, pk);
                 self.st.lock().unwrap().mono = Some(e.clone());
                 e
             }
@@ -1105,6 +1111,30 @@ mod tests {
         assert_eq!(back["regions"], json!([]));
         assert_eq!(back["version"].as_u64().unwrap(), v);
         assert_eq!(back["undo"], 1);
+    }
+
+    #[test]
+    fn the_zoomed_out_outline_follows_the_sound_after_undo_and_another_edit() {
+        // Normalize, undo, then turn it down: the normalized sound is freed on the way, and its
+        // outline must not be drawn for the sound that replaces it.
+        let d = Doc::new(Engine::start());
+        let n = 200_000;
+        d.open(Sound::new(vec![(0..n).map(|i| 0.25 * (i as f32 * 0.01).sin()).collect()], 1000), None);
+        let top = |d: &Doc| {
+            let b = d.peaks(None, 0.0, 4000.0, 50).unwrap();
+            b.chunks_exact(4).skip(50).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).fold(0.0f32, f32::max)
+        };
+        assert!((top(&d) - 0.25).abs() < 0.01);
+        // Whether a freed address is handed out again at once is up to the allocator, so the
+        // round is repeated until it would have been.
+        for round in 0..40 {
+            d.edit(&json!({"kind": "normalize", "db": 0, "ui": ui(None, 0)})).unwrap();
+            assert!((top(&d) - 1.0).abs() < 0.01, "round {round}: normalized outline of {}", top(&d));
+            d.undo(false, ui(None, 0)).unwrap();
+            d.edit(&json!({"kind": "gain", "db": -20, "ui": ui(None, 0)})).unwrap();
+            assert!((top(&d) - 0.025).abs() < 0.002, "round {round}: outline of {} for a sound peaking at 0.025", top(&d));
+            d.undo(false, ui(None, 0)).unwrap();
+        }
     }
 
     #[test]

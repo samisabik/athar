@@ -1038,3 +1038,60 @@ fn finder_style_changes_keep_metadata() {
     assert_eq!(meta(&c), kept);
     assert_eq!(paths(pid), set(&[&c.to_string_lossy()]));
 }
+
+// ---------- benchmark (run by hand)
+
+/// Times a fresh library on a real folder: model load, import until idle, text and similar
+/// searches, the first Map. Prints one JSON line. Run with
+/// `ATHAR_BENCH_DIR=<folder> cargo test --release bench_ -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_a_fresh_library_on_a_real_folder() {
+    let Ok(dir) = std::env::var("ATHAR_BENCH_DIR") else { return };
+    let t = Tmp::new();
+    let t0 = std::time::Instant::now();
+    let lib = running(&t.0);
+    let model_s = t0.elapsed().as_secs_f64();
+    let t1 = std::time::Instant::now();
+    lib.add_folder(&dir).unwrap();
+    // Idle: nothing queued, and the count unchanged for two seconds.
+    let mut last = (usize::MAX, std::time::Instant::now());
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let n = lib.store.read().unwrap().items.len();
+        let pending = lib.status()["pending_jobs"].as_u64().unwrap_or(0);
+        if n != last.0 || pending > 0 {
+            last = (n, std::time::Instant::now());
+        } else if last.1.elapsed().as_secs_f64() >= 2.0 {
+            break;
+        }
+    }
+    let import_s = last.1.duration_since(t1).as_secs_f64();
+    let n = last.0;
+    let queries = ["deep punchy kick drum", "rain on a window", "warm analog pad", "vocal chop", "metallic impact", "glitchy texture",
+        "808 bass", "bright hi-hat", "dark drone", "riser", "snare with reverb", "plucked synth", "crowd noise", "wind", "laser zap",
+        "piano chord", "dusty vinyl loop", "sub bass", "clap", "whoosh"];
+    let mut text_ms = vec![];
+    let mut tops = vec![];
+    for q in queries {
+        let s = std::time::Instant::now();
+        let v = lib.embed_text(q).unwrap();
+        let r = lib.search(&SearchQuery { limit: Some(200), ..Default::default() }, Some(v), None, Some(q)).unwrap();
+        text_ms.push(s.elapsed().as_secs_f64() * 1000.0);
+        tops.push(r.as_array().unwrap().iter().take(5).map(|x| x["name"].as_str().unwrap_or("").to_string()).collect::<Vec<_>>());
+    }
+    let all = lib.search(&SearchQuery { sort: Some("name".into()), limit: Some(100000), ..Default::default() }, None, None, None).unwrap();
+    let paths: Vec<String> = all.as_array().unwrap().iter().step_by((n / 20).max(1)).take(20).map(|x| x["path"].as_str().unwrap().to_string()).collect();
+    let mut similar_ms = vec![];
+    for p in &paths {
+        let s = std::time::Instant::now();
+        let v = lib.embedding_of(p).unwrap();
+        lib.search(&SearchQuery { limit: Some(200), ..Default::default() }, Some(v), Some(p), None).unwrap();
+        similar_ms.push(s.elapsed().as_secs_f64() * 1000.0);
+    }
+    let s = std::time::Instant::now();
+    let map = lib.sound_map();
+    let map_s = s.elapsed().as_secs_f64();
+    println!("BENCH {}", json!({"app": "rust", "files": n, "model_s": model_s, "import_s": import_s, "text_ms": text_ms, "similar_ms": similar_ms,
+        "map_s": map_s, "map_points": map.as_array().map_or(0, |a| a.len()), "queries": queries, "tops": tops, "similar_paths": paths}));
+}
