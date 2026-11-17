@@ -1,7 +1,11 @@
-let menu = null, owner = null, active = -1;
+/** The open menu, and the select it belongs to. @type {HTMLElement | null} */
+let menu = null;
+/** @type {HTMLSelectElement | null} */
+let owner = null;
+let active = -1;
 
 function close(refocus = true) {
-  if (!menu) return;
+  if (!menu || !owner) return;
   menu.remove(); menu = null;
   owner.setAttribute('aria-expanded', 'false');
   owner.removeAttribute('aria-activedescendant');
@@ -9,8 +13,10 @@ function close(refocus = true) {
   owner = null; active = -1;
 }
 
+/** @param {number} i */
 function choose(i) {
-  const sel = owner, opt = sel.options[i];
+  const sel = owner; if (!sel) return;
+  const opt = sel.options[i];
   if (!sel.isConnected) return close(false);
   close();
   if (!opt || opt.disabled || sel.selectedIndex === i) return;
@@ -19,7 +25,9 @@ function choose(i) {
   sel.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+/** @param {number} i */
 function mark(i) {
+  if (!menu || !owner) return;
   const items = menu.querySelectorAll('.dd-item');
   items[active]?.classList.remove('active');
   active = Math.max(0, Math.min(items.length - 1, i));
@@ -29,24 +37,29 @@ function mark(i) {
 }
 
 // Moves from `from` in direction `dir`, skipping disabled options.
+/** @param {number} from @param {number} dir */
 function move(from, dir) {
+  if (!owner) return;
   const o = owner.options;
   for (let i = from; i >= 0 && i < o.length; i += dir) if (!o[i].disabled) return mark(i);
 }
 
+/** @param {string} ch */
 function typeahead(ch) {
+  if (!owner) return;
   const o = [...owner.options], n = o.length;
   for (let k = 1; k <= n; k++) {
     const i = (active + k + n) % n;
-    if (!o[i].disabled && o[i].textContent.trim().toLowerCase().startsWith(ch)) return mark(i);
+    if (!o[i].disabled && (o[i].textContent || '').trim().toLowerCase().startsWith(ch)) return mark(i);
   }
 }
 
+/** @param {HTMLSelectElement} sel */
 function open(sel, keyboard = false) {
   if (sel.options.length < 2) return;
   close(false);
   owner = sel;
-  menu = document.createElement('div');
+  const m = menu = document.createElement('div');
   menu.className = 'dd-menu';
   menu.id = 'dd-menu';
   menu.setAttribute('role', 'listbox');
@@ -61,7 +74,7 @@ function open(sel, keyboard = false) {
     it.addEventListener('mousedown', (e) => { e.preventDefault(); e.stopPropagation(); });
     it.addEventListener('click', (e) => { e.stopPropagation(); choose(i); });
     it.addEventListener('mousemove', () => { if (active !== i) mark(i); });
-    menu.append(it);
+    m.append(it);
   });
   document.body.append(menu);
   sel.setAttribute('aria-expanded', 'true');
@@ -79,10 +92,11 @@ function open(sel, keyboard = false) {
   else active = -1;
 }
 
+/** @param {EventTarget | null} t @returns {t is HTMLSelectElement} */
 const usable = (t) => t instanceof HTMLSelectElement && !t.multiple && !t.disabled && t.size <= 1;
 
 document.addEventListener('mousedown', (e) => {
-  if (menu && !menu.contains(e.target)) {
+  if (menu && !menu.contains(/** @type {Node} */ (e.target))) {
     const same = e.target === owner;
     close(false);
     if (same) { e.preventDefault(); return; }
@@ -115,4 +129,4 @@ document.addEventListener('keydown', (e) => {
 }, true);
 
 window.addEventListener('resize', () => close(false));
-document.addEventListener('scroll', (e) => { if (menu && !menu.contains(e.target)) close(false); }, true);
+document.addEventListener('scroll', (e) => { if (menu && !menu.contains(/** @type {Node} */ (e.target))) close(false); }, true);

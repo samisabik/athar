@@ -10,3 +10,5 @@ __pycache__/
 .ruff_cache/
 
 core/target/
+app/target/
+node_modules/

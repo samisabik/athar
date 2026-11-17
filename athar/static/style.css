@@ -728,3 +728,13 @@ body.indexing #toast { bottom: 92px; }
 .arr-row.missing .qn { color: var(--muted); text-decoration: line-through; }
 .arr-after { position: absolute; top: 22px; bottom: 0; right: 0; background: var(--bg); opacity: .55; border-left: 1px solid var(--line); pointer-events: none; }
 .arr-playhead { position: absolute; top: 0; bottom: 0; left: 0; width: 2px; margin-left: -1px; background: var(--hi); z-index: 1; pointer-events: none; }
+
+/* A download's progress, shown in place of its button's icon. */
+.ib.pct .i { font-family: inherit; font-size: 11px; font-variant-numeric: tabular-nums; }
+
+/* A found sound playing: its outline filled in the accent colour up to where it is. */
+.mini { position: relative; }
+.mini-played { position: absolute; inset: 0; color: var(--accent); clip-path: inset(0 100% 0 0); }
+.mini-played path { stroke-width: 1.75px; }
+.mini path.track { stroke: var(--line); }
+.mini-played path.track { stroke: var(--accent); stroke-width: 2px; }

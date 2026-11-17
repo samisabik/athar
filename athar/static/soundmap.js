@@ -1,4 +1,5 @@
-import { fmtTime } from './audio.js';
+import { lib } from './native.js';
+import { fmtTime } from './time.js';
 
 const DOT = 4.5, HIT = 12, DWELL_MS = 140;
 
@@ -21,30 +22,60 @@ const FAMILY = Object.fromEntries(Object.entries(FAMILIES).flatMap(([family, kin
 
 // The words of a file name that can describe a sound: no numbers, note names, tempo or format.
 const DULL = new Set(['wav', 'aif', 'aiff', 'flac', 'mp3', 'ogg', 'm4a', 'bpm', 'one', 'shot', 'oneshot', 'loop', 'the', 'and', 'edit', 'min', 'maj', 'sample']);
+/** @param {string} name */
 function wordsOf(name) {
   return name.toLowerCase().split(/[^a-z]+/).filter(w => w.length > 2 && !DULL.has(w));
 }
 // A word that most file names in a group share, if there is one, leaving out the name of the
 // kind itself and the words every file has.
+/** @param {Point[]} group @param {Set<string>} common */
 function sharedWord(group, common) {
+  /** @type {Map<string, number>} */
   const count = new Map(), kind = new Set(wordsOf(group[0].category || ''));
   for (const p of group) for (const w of new Set(wordsOf(p.name))) if (!common.has(w) && !kind.has(w)) count.set(w, (count.get(w) || 0) + 1);
   const [word, n] = [...count].sort((a, b) => b[1] - a[1])[0] || [];
   return word && n >= 2 && n >= group.length * 0.5 ? word : '';
 }
 
+/** A sound on the map, at x and y between 0 and 1.
+    @typedef {{ path: string, name: string, x: number, y: number, category: string | null, duration: number, sr: number }} Point */
+/** A group name at the middle of its sounds; key is `g:` and a family or `c:` and a kind. @typedef {{ key: string, text: string, n: number, x: number, y: number }} Name */
+/** Where a group name was drawn, to find it under the pointer. @typedef {{ x: number, y: number, w: number, h: number, name: string }} NameBox */
+/** @typedef {typeof import('./ui.js')} UI */
+/** What the page uses from main.js.
+    @typedef {{ el: UI['el'], ib: UI['ib'], icon: UI['icon'], fail: UI['fail'], busy: UI['busy'],
+      preview(p: Point): void, stop(): void, edit(p: Point): void, similar(p: Point): void }} SoundMapHelpers */
+
 export class SoundMap {
+  /** @param {HTMLElement} root @param {SoundMapHelpers} h */
   constructor(root, h) {
     this.root = root; this.h = h;
-    this.points = []; this.zoom = 1; this.ox = 0; this.oy = 0; this.hover = null; this.picked = null; this.stamp = '';
+    /** @type {Point[]} */
+    this.points = [];
+    this.zoom = 1; this.ox = 0; this.oy = 0;
+    /** @type {Point | null} */
+    this.hover = null;
+    /** @type {Point | null} */
+    this.picked = null;
+    this.stamp = '';
+    /** @type {boolean | undefined} */ this.queued;
+    /** @type {boolean | undefined} */ this.moving;
+    /** @type {string | null | undefined} */ this.lockCat;
+    /** @type {string | null | undefined} */ this.hoverCat;
+    /** @type {Point | null | undefined} */ this.hoverPlaying;
+    /** @type {[number, number] | null | undefined} */ this.pointer;
+    /** @type {NameBox[] | undefined} */ this.labels;
+    /** @type {{ key: string, canvas: HTMLCanvasElement } | undefined} */ this.land;
+    /** @type {{ stamp: string, level: number, list: Name[] } | undefined} */ this.named;
+    /** @type {{ stamp: string, words: Set<string> } | undefined} */ this.common;
     const { el, ib } = h;
     this.canvas = el('canvas', { class: 'map-canvas', tabindex: '0', 'aria-label': 'Map of your sounds' });
     this.info = el('div', { class: 'map-info' });
     this.note = el('span', { class: 'scope' });
-    root.querySelector('.cmdline').append(
+    /** @type {HTMLElement} */ (root.querySelector('.cmdline')).append(
       ib('zoom_in', 'Zoom in', () => this.zoomBy(1.4)), ib('zoom_out', 'Zoom out', () => this.zoomBy(1 / 1.4)), ib('fit_screen', 'Show the whole map', () => { this.zoom = 1; this.ox = this.oy = 0; this.draw(); }),
       el('span', { class: 'spacer' }), this.note);
-    root.querySelector('.map-body').append(this.canvas, this.info);
+    /** @type {HTMLElement} */ (root.querySelector('.map-body')).append(this.canvas, this.info);
     this.bind();
     new ResizeObserver(() => this.draw()).observe(this.canvas);
   }
@@ -52,16 +83,18 @@ export class SoundMap {
   async show() {
     if (!this.points.length) this.h.busy('Laying out your sounds');
     try {
-      const pts = await this.h.api('/api/map');
+      /** @type {Point[]} */
+      const pts = await lib.soundMap();
       this.points = pts; this.stamp = String(Date.now());
       this.note.textContent = pts.length ? '' : 'Add a folder of sounds to see the map';
-      if (this.picked && !pts.some(p => p.path === this.picked.path)) this.picked = null;
+      if (this.picked && !pts.some(p => p.path === /** @type {Point} */ (this.picked).path)) this.picked = null;
       this.h.busy('');
     } catch (e) { this.h.fail(e); }
     this.paintInfo(); this.draw();
   }
 
   // Map position (0 to 1) to canvas pixels, with a margin so edge dots are not clipped.
+  /** @param {{ x: number, y: number }} p @param {number} W @param {number} H @returns {[number, number]} */
   place(p, W, H) {
     const m = 28, s = Math.min(W, H) - m * 2;
     return [(W - s) / 2 + (p.x - 0.5) * s * this.zoom + s / 2 + this.ox, (H - s) / 2 + (0.5 - p.y) * s * this.zoom + s / 2 + this.oy];
@@ -78,7 +111,7 @@ export class SoundMap {
     const cv = this.canvas, dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
     if (!W || !H) return;
     if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
-    const g = cv.getContext('2d'), css = getComputedStyle(document.documentElement), seen = {}, col = (n) => seen[n] ??= css.getPropertyValue(n).trim();
+    const g = /** @type {CanvasRenderingContext2D} */ (cv.getContext('2d')), css = getComputedStyle(document.documentElement), seen = /** @type {Record<string, string>} */ ({}), col = (/** @type {string} */ n) => seen[n] ??= css.getPropertyValue(n).trim();
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     g.fillStyle = col('--wave-bg'); g.fillRect(0, 0, W, H);
     const at = this.points.map(p => this.place(p, W, H));
@@ -91,7 +124,7 @@ export class SoundMap {
     // Sounds show near the pointer, for the kind in focus, and everywhere once zoomed in.
     const near = this.pointer, everywhere = this.zoom >= 2.5;
     this.points.forEach((p, i) => {
-      const [x, y] = at[i], close = near && (x - near[0]) ** 2 + (y - near[1]) ** 2 < 90 * 90, inFocus = focus && (focus === `c:${p.category}` || focus === `g:${FAMILY[p.category] || p.category}`);
+      const [x, y] = at[i], close = near && (x - near[0]) ** 2 + (y - near[1]) ** 2 < 90 * 90, inFocus = focus && (focus === `c:${p.category}` || focus === `g:${FAMILY[/** @type {string} */ (p.category)] || p.category}`);
       if (!close && !inFocus && !everywhere) return;
       g.beginPath(); g.arc(x, y, inFocus ? DOT : DOT - 1, 0, Math.PI * 2);
       g.fillStyle = inFocus ? col('--ink') : col('--raised'); g.fill();
@@ -101,6 +134,7 @@ export class SoundMap {
     // kinds within them; closer still, the word their file names share, on its own. Bigger groups are named
     // first, and a name that would cover another is left out.
     g.font = '13px "Share Tech Mono", ui-monospace, monospace';
+    /** @type {{ x: number, y: number, w: number, h: number }[]} */
     const placed = []; this.labels = [];
     for (const l of this.names()) {
       const [px, py] = this.place(l, W, H), w = g.measureText(l.text).width + 14, h = 20, x = px - w / 2, y = py - h - 12;
@@ -112,7 +146,7 @@ export class SoundMap {
       g.strokeStyle = col('--ink'); g.lineWidth = 1; g.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
       g.fillStyle = on ? col('--raised') : col('--ink'); g.fillText(l.text, x + 7, y + 14);
     }
-    for (const [p, r] of [[this.picked, DOT + 3], [this.hover, DOT + 2]]) {
+    for (const [p, r] of /** @type {[Point | null, number][]} */ ([[this.picked, DOT + 3], [this.hover, DOT + 2]])) {
       if (!p) continue;
       const [x, y] = this.place(p, W, H);
       g.fillStyle = col('--accent'); g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.fill();
@@ -126,6 +160,7 @@ export class SoundMap {
   }
 
   // The landscape as a small picture, redrawn only when the view, the sounds or the colours change.
+  /** @param {[number, number][]} at @param {number} W @param {number} H @param {string} paper @param {string} accent */
   terrain(at, W, H, paper, accent) {
     // Heights are worked out on a coarse grid, then every screen pixel reads its own height from between
     // the grid points, so the edges of the bands come out as smooth curves. While the map is being
@@ -154,12 +189,12 @@ export class SoundMap {
       for (let i = Math.max(-reach, -y); i <= Math.min(reach, gh - 1 - y); i++) f[(y + i) * gw + x] += v * kernel[i + reach];
     }
     let top = 0; for (let i = 0; i < f.length; i++) if (f[i] > top) top = f[i];
-    const rgb = (hex) => { hex = hex.trim(); if (hex.length === 4) hex = '#' + [...hex.slice(1)].map(c => c + c).join(''); return [1, 3, 5].map(n => parseInt(hex.slice(n, n + 2), 16)); };
-    const a = rgb(paper), b = rgb(accent), LEVELS = 7, shades = [];
+    const rgb = (/** @type {string} */ hex) => { hex = hex.trim(); if (hex.length === 4) hex = '#' + [...hex.slice(1)].map(c => c + c).join(''); return [1, 3, 5].map(n => parseInt(hex.slice(n, n + 2), 16)); };
+    const a = rgb(paper), b = rgb(accent), LEVELS = 7, shades = /** @type {number[][]} */ ([]);
     for (let l = 0; l <= LEVELS; l++) { const t = l / LEVELS, m = l ? t * t * 0.9 + 0.06 : 0; shades.push([a[0] + (b[0] - a[0]) * m, a[1] + (b[1] - a[1]) * m, a[2] + (b[2] - a[2]) * m]); }
     const pw = Math.round(W * scale), ph = Math.round(H * scale);
     const canvas = this.land?.canvas || document.createElement('canvas'); canvas.width = pw; canvas.height = ph;
-    const ctx = canvas.getContext('2d'), img = ctx.createImageData(pw, ph), d = new Uint32Array(img.data.buffer);
+    const ctx = /** @type {CanvasRenderingContext2D} */ (canvas.getContext('2d')), img = ctx.createImageData(pw, ph), d = new Uint32Array(img.data.buffer);
     const packed = shades.map(sh => (255 << 24) | (Math.round(sh[2]) << 16) | (Math.round(sh[1]) << 8) | Math.round(sh[0]));
     // Height to band, looked up from a table so the per-pixel work stays small.
     const steps = 1024, band = new Uint8Array(steps + 1);
@@ -185,14 +220,14 @@ export class SoundMap {
   names() {
     const level = Math.min(5, Math.floor(Math.log2(this.zoom) + 0.35));
     if (this.named?.stamp === this.stamp && this.named.level === level) return this.named.list;
-    const cell = 0.26 / 2 ** level, broad = level === 0, cells = new Map();
+    const cell = 0.26 / 2 ** level, broad = level === 0, cells = /** @type {Map<string, Map<string, Point[]>>} */ (new Map());
     for (const p of this.points) {
       if (!p.category) continue;
       const key = broad ? `g:${FAMILY[p.category] || p.category}` : `c:${p.category}`, id = `${Math.floor(p.x / cell)},${Math.floor(p.y / cell)}`;
-      const kinds = cells.get(id) || cells.set(id, new Map()).get(id);
-      (kinds.get(key) || kinds.set(key, []).get(key)).push(p);
+      const kinds = /** @type {Map<string, Point[]>} */ (cells.get(id) || cells.set(id, new Map()).get(id));
+      /** @type {Point[]} */ (kinds.get(key) || kinds.set(key, []).get(key)).push(p);
     }
-    const least = broad ? 3 : 2, all = [];
+    const least = broad ? 3 : 2, all = /** @type {Name[]} */ ([]);
     for (const kinds of cells.values()) {
       const [key, group] = [...kinds].sort((a, b) => b[1].length - a[1].length)[0];
       if (group.length < least) continue;
@@ -201,6 +236,7 @@ export class SoundMap {
         x: group.reduce((t, p) => t + p.x, 0) / group.length, y: group.reduce((t, p) => t + p.y, 0) / group.length });
     }
     // The same name in neighbouring squares is one group cut in two: the bigger half keeps it.
+    /** @type {Name[]} */
     const list = [];
     for (const l of all.sort((a, b) => b.n - a.n)) {
       if (!list.some(k => k.text === l.text && Math.abs(k.x - l.x) < cell * 1.2 && Math.abs(k.y - l.y) < cell * 1.2)) list.push(l);
@@ -212,6 +248,7 @@ export class SoundMap {
   // Words in more than a third of all file names (a pack's own name, say) describe nothing.
   commonWords() {
     if (this.common?.stamp === this.stamp) return this.common.words;
+    /** @type {Map<string, number>} */
     const count = new Map();
     for (const p of this.points) for (const w of new Set(wordsOf(p.name))) count.set(w, (count.get(w) || 0) + 1);
     const words = new Set([...count].filter(([, n]) => n > this.points.length / 3).map(([w]) => w));
@@ -219,15 +256,20 @@ export class SoundMap {
     return words;
   }
 
+  /** @param {number} x @param {number} y */
   labelAt(x, y) { return (this.labels || []).find(b => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h)?.name || null; }
 
+  /** @param {number} x @param {number} y */
   nearest(x, y) {
     const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
-    let best = null, d = HIT * HIT;
+    /** @type {Point | null} */
+    let best = null;
+    let d = HIT * HIT;
     for (const p of this.points) { const [px, py] = this.place(p, W, H), q = (px - x) ** 2 + (py - y) ** 2; if (q < d) { d = q; best = p; } }
     return best;
   }
 
+  /** @param {number} k */
   zoomBy(k, x = this.canvas.clientWidth / 2, y = this.canvas.clientHeight / 2) {
     const z = Math.min(40, Math.max(1, this.zoom * k)), r = z / this.zoom, cx = this.canvas.clientWidth / 2, cy = this.canvas.clientHeight / 2;
     this.ox = (x - cx) - ((x - cx) - this.ox) * r; this.oy = (y - cy) - ((y - cy) - this.oy) * r;
@@ -237,7 +279,9 @@ export class SoundMap {
 
   bind() {
     const cv = this.canvas;
-    let drag = null, dwell = 0;
+    /** @type {{ x: number, y: number, ox: number, oy: number, moved: boolean } | null} */
+    let drag = null;
+    let dwell = 0;
     // Only the main button drags, and a drag also ends if the pointer is taken away, as a context menu does.
     const endDrag = () => { drag = null; if (this.moving) { this.moving = false; this.draw(); } };
     cv.addEventListener('pointercancel', endDrag); cv.addEventListener('lostpointercapture', endDrag);
@@ -289,8 +333,9 @@ export class SoundMap {
       el('button', { class: 'primary', onclick: () => this.h.edit(p) }, icon('edit'), 'Edit'));
   }
 
+  /** @param {KeyboardEvent} e */
   handleKey(e) {
-    if (e.key === ' ' && (this.picked || this.hover)) { e.preventDefault(); this.h.preview(this.picked || this.hover); return true; }
+    if (e.key === ' ' && (this.picked || this.hover)) { e.preventDefault(); this.h.preview(/** @type {Point} */ (this.picked || this.hover)); return true; }
     if (e.key === 'Escape') { this.h.stop(); return true; }
     if (e.key === '=' || e.key === '+') { this.zoomBy(1.4); return true; }
     if (e.key === '-') { this.zoomBy(1 / 1.4); return true; }

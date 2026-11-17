@@ -1,4 +1,6 @@
-import { fmtTime } from './audio.js';
+import { lib } from './native.js';
+import { invoke, listen, now, play as playSound, stop as stopSound, onEnded } from './engine.js';
+import { fmtTime } from './time.js';
 
 // Ideas for the dice. Archives match titles and tags, so these stay short and concrete.
 const IDEAS = `
@@ -15,34 +17,83 @@ wax cylinder|78 rpm|gramophone|old radio drama|radio jingle|newsreel|public anno
 const TWISTS = ['distant', 'close', 'slow', 'old', 'broken', 'tiny', 'huge', 'underwater', 'metal', 'wooden', 'glass', 'night', 'empty', 'crowded', 'rusty', 'wet', 'frozen', 'electric', 'toy', 'giant'];
 const THINGS = ['bell', 'door', 'engine', 'drum', 'pipe', 'machine', 'room', 'street', 'forest', 'radio', 'clock', 'bridge', 'gate', 'fan', 'motor', 'whistle', 'horn', 'chain', 'spring', 'wire', 'tank', 'bowl', 'box', 'hall', 'market', 'harbor', 'factory', 'kitchen', 'train', 'piano'];
 // Deals every idea once before any repeats, with a made-up pairing now and then.
+/** @type {string[]} */
 let bag = [];
+/** @returns {string} */
 function nextIdea() {
   if (Math.random() < 0.15) return `${TWISTS[Math.floor(Math.random() * TWISTS.length)]} ${THINGS[Math.floor(Math.random() * THINGS.length)]}`;
   if (!bag.length) { bag = [...IDEAS]; for (let i = bag.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [bag[i], bag[j]] = [bag[j], bag[i]]; } }
-  return bag.pop();
+  return /** @type {string} */ (bag.pop());
 }
 const HELLOS = ['What have you never heard?', 'Go find something strange.', 'Dig somewhere new.', 'What is out there?', 'Borrow a sound from the world.', 'Somebody recorded this.', 'Find a sound nobody else has.'];
 const PLACEHOLDER = 'Search free sound archives';
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const DEST_KEY = 'athar-discover-project', SOURCE_KEY = 'athar-discover-source';
-const remember = (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { } };
-const recall = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
-const mb = (n) => n ? `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MB` : '';
+const remember = (/** @type {string} */ k, /** @type {string | null} */ v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { } };
+const recall = (/** @type {string} */ k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const mb = (/** @type {number | undefined} */ n) => n ? `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MB` : '';
+
+/** @typedef {typeof import('./ui.js')} UI */
+/** @typedef {{ id: string, name: string }} Source */
+/** A sound an archive found. One without a url holds several recordings, listed by discover_files.
+    @typedef {{ id: string | number, title: string, creator?: string, url?: string | null, duration?: number | null, license?: string, via?: string, page?: string, wave?: number[] | null }} Found */
+/** @typedef {{ name: string, url: string, duration?: number | null, size?: number }} FoundFile */
+/** @typedef {{ id: number, name: string, folder?: string | null }} Project */
+/** @typedef {{ key: string, partial: boolean, duration: number }} Preview */
+/** What the page uses from main.js.
+    @typedef {{ el: UI['el'], ib: UI['ib'], icon: UI['icon'], notice: UI['notice'], fail: UI['fail'], modal: UI['modal'], focusable: UI['focusable'],
+      projectFolder(p: Project): Promise<unknown>, volume(): number, stopOthers?(): void, onAdd?(): void }} DiscoverHelpers */
 
 /** Search of free online sound archives. A found sound plays from the archive; adding it
     downloads it into a library folder with its licence and origin in the note. */
 export class Discover {
+  /** @param {HTMLElement} root @param {DiscoverHelpers} h */
   constructor(root, h) {
     this.root = root; this.h = h;
+    /** @type {Source[]} */
     this.sources = []; this.source = recall(SOURCE_KEY) || 'openverse';
-    this.query = ''; this.page = 1; this.items = []; this.more = false; this.seq = 0;
-    this.open = new Map(); this.added = new Set(); this.busy = new Set();
+    /** @type {Found[]} */
+    this.items = [];
+    this.query = ''; this.page = 1; this.more = false; this.seq = 0;
+    /** @type {Map<string | number, FoundFile[] | null>} */
+    this.open = new Map();
+    /** @type {Set<string>} */
+    this.added = new Set();
+    /** @type {Set<string>} */
+    this.busy = new Set();
+    // While a sound downloads, its buttons show how much has arrived.
+    listen('discover-progress', ({ url, got, total }) => {
+      const pct = total ? Math.min(99, Math.floor(got / total * 100)) : null;
+      for (const b of document.querySelectorAll('[data-fetching]')) {
+        if (/** @type {HTMLElement} */ (b).dataset.fetching !== url || pct == null) continue;
+        b.classList.add('pct'); /** @type {HTMLElement} */ (b.querySelector('.i')).textContent = `${pct}%`;
+      }
+    });
     this.dest = recall(DEST_KEY);
-    this.player = new Audio(); this.player.preload = 'none'; this.playingUrl = null;
-    // Archives can take several seconds to start sending a file, so the button shows the wait.
-    this.player.onplaying = () => { this.waiting = false; this.paint(); };
-    this.player.onwaiting = () => { if (this.playingUrl) { this.waiting = true; this.paint(); } };
-    this.player.onended = this.player.onerror = () => { if (this.player.error && this.playingUrl) this.h.notice('That sound could not be played from the archive'); this.playingUrl = null; this.paint(); };
+    // Previews are fetched and played natively; each found sound is fetched once.
+    /** @type {string | null} */
+    this.playingUrl = null;
+    /** @type {number | null} */
+    this.voice = null;
+    /** @type {Map<string, Promise<Preview>>} */
+    this.fetched = new Map();
+    /** @type {HTMLDivElement} */ this.hello;
+    /** @type {HTMLInputElement} */ this.q;
+    /** @type {HTMLSelectElement} */ this.sourceSel;
+    /** @type {HTMLDivElement} */ this.filters;
+    /** @type {HTMLButtonElement} */ this.filterBtn;
+    /** @type {HTMLSpanElement} */ this.scope;
+    /** @type {HTMLDivElement} */ this.list;
+    /** @type {Project[]} */ this.projects;
+    /** @type {boolean | undefined} */ this.visible;
+    /** @type {boolean | undefined} */ this.loading;
+    /** @type {boolean | undefined} */ this.waiting;
+    /** @type {boolean | undefined} */ this.toldPartial;
+    /** @type {boolean | undefined} */ this.outlining;
+    /** @type {string | null | undefined} */ this.idea;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */ this.typing;
+    /** @type {number | undefined} */ this.cur;
+    /** @type {'name' | 'duration' | null | undefined} */ this.sort;
     this.build();
   }
 
@@ -62,17 +113,17 @@ export class Discover {
     this.filterBtn.setAttribute('aria-expanded', 'false');
     this.scope = el('span', { class: 'scope' });
     this.list = el('div', { class: 'list big disc-list' });
-    this.root.querySelector('.disc-top').append(this.hello,
+    /** @type {HTMLElement} */ (this.root.querySelector('.disc-top')).append(this.hello,
       el('div', { class: 'searchbar' }, el('span', { class: 'i lead' }, 'travel_explore'), this.q, this.filterBtn),
       this.filters,
       el('div', { class: 'scope-row' }, this.scope));
-    this.root.querySelector('.stack').append(this.list);
+    /** @type {HTMLElement} */ (this.root.querySelector('.stack')).append(this.list);
   }
 
   async show() {
     // Asked every time, since a Freesound key added in Settings adds an archive.
     this.visible = true;
-    this.sources = await this.h.api('/api/discover/sources');
+    this.sources = await lib.discoverSources();
     if (!this.sources.some(s => s.id === this.source)) this.source = this.sources[0].id;
     this.root.classList.remove('idle');
     this.paint();
@@ -81,7 +132,7 @@ export class Discover {
   // Added sounds always go into a project, downloaded into its folder. The last project
   // picked is remembered while it still exists.
   async checkDest() {
-    this.projects = await this.h.api('/api/projects');
+    this.projects = await lib.projects();
     if (!this.projects.some(p => String(p.id) === this.dest)) this.dest = null;
   }
   async chooseDest() {
@@ -89,7 +140,7 @@ export class Discover {
     if (!this.projects.length) { this.h.notice('Create a project on the Projects page first. Found sounds are added to a project.'); return null; }
     const pick = await this.h.modal('Add found sounds to', [{ label: 'Project', options: this.projects.map(p => [String(p.id), p.folder ? p.name : `${p.name} (needs a folder)`]), value: this.dest || undefined }]);
     if (!pick) return null;
-    const p = this.projects.find(x => String(x.id) === pick[0]);
+    const p = /** @type {Project} */ (this.projects.find(x => String(x.id) === pick[0]));
     // The download has to land somewhere on disk, so a project without a folder gets one now.
     if (!p.folder && !await this.h.projectFolder(p)) return null;
     this.dest = pick[0]; remember(DEST_KEY, this.dest);
@@ -99,6 +150,7 @@ export class Discover {
   }
 
   // Before a search the box sits in the middle of the page, as in the Library.
+  /** @param {boolean} idle */
   setIdle(idle) {
     if (this.root.classList.contains('idle') === idle) return;
     this.root.classList.toggle('idle', idle);
@@ -120,6 +172,7 @@ export class Discover {
   }
 
 
+  /** @param {string} query */
   async search(query, page = 1) {
     query = query.trim(); if (!query) return;
     const seq = ++this.seq;
@@ -127,7 +180,7 @@ export class Discover {
     if (page === 1) { this.items = []; this.open.clear(); this.stop(); this.cur = 0; }
     this.paint();
     try {
-      const r = await this.h.api('/api/discover/search', { json: { source: this.source, query, page } });
+      const r = await lib.discoverSearch({ source: this.source, query, page });
       if (seq !== this.seq) return;
       this.items = page === 1 ? r.items : [...this.items, ...r.items];
       this.page = page; this.more = r.more;
@@ -135,27 +188,50 @@ export class Discover {
     finally { if (seq === this.seq) { this.loading = false; this.paint(); this.loadOutlines(); } }
   }
 
+  /** @param {Found} it */
   async toggleFiles(it) {
     if (this.open.has(it.id)) { this.open.delete(it.id); return this.paint(); }
     this.open.set(it.id, null); this.paint();
     try {
       const seen = new Set();
-      const files = (await this.h.api('/api/discover/files', { json: { source: this.source, id: it.id } })).filter(f => !seen.has(f.url) && seen.add(f.url));
+      /** @type {FoundFile[]} */
+      const files = (await lib.discoverFiles({ source: this.source, id: it.id })).filter((/** @type {FoundFile} */ f) => !seen.has(f.url) && seen.add(f.url));
       if (this.open.has(it.id)) this.open.set(it.id, files);
     } catch (e) { this.open.delete(it.id); this.h.fail(e); }
     this.paint();
   }
 
-  play(url) {
+  /** @param {string} url */
+  async play(url) {
     if (this.playingUrl === url) return this.stop();
     this.h.stopOthers?.();
-    this.player.src = url; this.player.volume = this.h.volume();
+    // Archives can take several seconds to send a file, so the button shows the wait.
     this.playingUrl = url; this.waiting = true;
-    this.player.play().catch((e) => { if (this.playingUrl === url && e?.name !== 'AbortError') { this.h.notice('That sound could not be played from the archive'); this.stop(); } });
+    this.paint();
+    try {
+      const duration = this.items.find(i => i.url === url)?.duration ?? [...this.open.values()].flat().find(f => f?.url === url)?.duration ?? null;
+      if (!this.fetched.has(url)) this.fetched.set(url, invoke('discover_preview', { url, duration }));
+      const { key, partial } = /** @type {Preview} */ (await this.fetched.get(url));
+      if (partial && !this.toldPartial) { this.toldPartial = true; this.h.notice('Long sounds preview their first part, so they start sooner. Add fetches the whole sound.', 6000); }
+      if (this.playingUrl !== url) return;
+      let id;
+      try { id = await playSound(key); }
+      catch { this.fetched.delete(url); this.fetched.set(url, invoke('discover_preview', { url, duration })); id = await playSound(/** @type {Preview} */ (await this.fetched.get(url)).key); }
+      if (this.playingUrl !== url) return void stopSound(id);
+      this.voice = id; this.waiting = false; this.paint();
+      this.followPlay(id, url, now(), duration || /** @type {Preview} */ (await this.fetched.get(url)).duration);
+      onEnded(id, () => { if (this.voice === id) { this.voice = null; this.playingUrl = null; this.paint(); } });
+    } catch (e) {
+      this.fetched.delete(url);
+      if (this.playingUrl === url) { this.h.notice(String(/** @type {Error} */ (e)?.message || e) || 'That sound could not be played from the archive'); this.stop(); }
+    }
+  }
+  stop() {
+    if (!this.playingUrl) return;
+    this.playingUrl = null; this.waiting = false;
+    if (this.voice != null) { stopSound(this.voice); this.voice = null; }
     this.paint();
   }
-  stop() { if (!this.playingUrl) return; this.playingUrl = null; this.waiting = false; this.player.pause(); this.player.removeAttribute('src'); this.paint(); }
-  setVolume(v) { this.player.volume = v; }
   /** Back to the landing: called when the page is left, so it opens fresh next time. */
   reset() {
     this.stop(); this.seq++; this.visible = false; clearTimeout(this.typing);
@@ -164,8 +240,9 @@ export class Discover {
     this.paint();
   }
 
+  /** @param {Found} it @param {FoundFile} [file] */
   async add(it, file) {
-    const url = file ? file.url : it.url;
+    const url = /** @type {string} */ (file ? file.url : it.url);
     if (this.busy.has(url) || this.added.has(url)) return;
     // Asked every time, with the last project already picked, so Enter repeats the choice.
     const dest = await this.chooseDest();
@@ -174,7 +251,7 @@ export class Discover {
     const src = this.sources.find(s => s.id === this.source)?.name || this.source;
     const note = [`${it.title}${it.creator ? ` by ${it.creator}` : ''}`, it.license, `From ${src}${it.via ? ` (${it.via})` : ''}: ${it.page}`].filter(Boolean).join('. ');
     try {
-      const r = await this.h.api('/api/discover/save', { json: { url, title: file ? file.name : it.title, project: +dest, note, source: this.source } });
+      const r = await lib.discoverSave({ url, title: file ? file.name : it.title, project: +dest, note, source: this.source });
       this.added.add(url);
       this.h.notice(`Added ${r.path.split('/').pop()} to ${this.projects.find(p => String(p.id) === dest)?.name || 'the project'}`);
       this.h.onAdd?.();
@@ -189,24 +266,28 @@ export class Discover {
     this.scope.textContent = this.loading ? 'Searching' : this.items.length ? `${this.items.length}${this.more ? '+' : ''} found for "${this.query}"` : '';
     this.setIdle(!this.items.length && !this.loading && !this.query);
 
+    /** @param {Found} it @param {FoundFile} [file] */
     const addBtn = (it, file) => {
-      const url = file ? file.url : it.url;
-      return this.added.has(url) ? ib('check', 'Added', () => { }, 'on')
-        : ib(this.busy.has(url) ? 'hourglass_top' : 'add', this.busy.has(url) ? 'Downloading' : 'Add to a project', (e) => { e.stopPropagation(); this.add(it, file); });
+      const url = /** @type {string} */ (file ? file.url : it.url);
+      if (this.added.has(url)) return ib('check', 'Added', () => { }, 'on');
+      const b = ib(this.busy.has(url) ? 'hourglass_top' : 'add', this.busy.has(url) ? 'Downloading' : 'Add to a project', (e) => { e.stopPropagation(); this.add(it, file); });
+      if (this.busy.has(url)) b.dataset.fetching = url;
+      return b;
     };
-    const playBtn = (url) => ib(this.playingUrl !== url ? 'play_arrow' : this.waiting ? 'hourglass_top' : 'stop', this.playingUrl === url && this.waiting ? 'Waiting for the archive to send the sound' : this.playingUrl === url ? 'Stop' : 'Play', (e) => { e.stopPropagation(); this.play(url); });
+    const playBtn = (/** @type {string} */ url) => { const b = ib(this.playingUrl !== url ? 'play_arrow' : this.waiting ? 'hourglass_top' : 'stop', this.playingUrl === url && this.waiting ? 'Waiting for the archive to send the sound' : this.playingUrl === url ? 'Stop' : 'Play', (e) => { e.stopPropagation(); this.play(url); }); if (this.playingUrl === url && this.waiting) b.dataset.fetching = url; return b; };
+    /** @type {HTMLElement[]} */
     const rows = [];
     // Column names sort what has been loaded so far; a second click goes back to the archive's own order.
-    const head = (label, key) => {
+    const head = (/** @type {string} */ label, /** @type {'name' | 'duration'} */ key) => {
       const on = this.sort === key, flip = () => { this.sort = on ? null : key; this.cur = 0; this.paint(); };
       return this.h.focusable(el('span', { class: 'th sortable' + (on ? ' on' : ''), role: 'button', 'data-tip': on ? 'Back to best match first' : `Sort by ${label}`, onclick: flip }, label), flip);
     };
     if (this.items.length) rows.push(el('div', { class: 'disc-row disc-head' }, el('span'), el('span'), head('name', 'name'), head('length', 'duration'), el('span')));
     for (const it of this.shown()) {
       const multi = !it.url, files = this.open.get(it.id), opened = this.open.has(it.id);
-      const act = multi ? () => this.toggleFiles(it) : () => this.play(it.url);
-      rows.push(this.h.focusable(el('div', { class: 'disc-row' + (opened ? ' on' : '') + (this.shown()[this.cur] === it ? ' cur' : ''), onclick: () => { this.cur = this.shown().indexOf(it); act(); }, 'data-tip': multi ? 'Click to see the recordings inside' : null },
-        multi ? ib(opened ? 'expand_more' : 'chevron_right', 'Show the recordings inside', (e) => { e.stopPropagation(); act(); }) : playBtn(it.url),
+      const act = multi ? () => this.toggleFiles(it) : () => this.play(/** @type {string} */ (it.url));
+      rows.push(this.h.focusable(el('div', { class: 'disc-row' + (opened ? ' on' : '') + (this.shown()[/** @type {number} */ (this.cur)] === it ? ' cur' : ''), onclick: () => { this.cur = this.shown().indexOf(it); act(); }, 'data-tip': multi ? 'Click to see the recordings inside' : null },
+        multi ? ib(opened ? 'expand_more' : 'chevron_right', 'Show the recordings inside', (e) => { e.stopPropagation(); act(); }) : playBtn(/** @type {string} */ (it.url)),
         this.outline(it),
         el('span', { class: 'qn' }, it.title, it.creator ? el('span', { class: 'qsub' }, it.creator) : null),
         el('span', { class: 'tc num' }, it.duration ? fmtTime(it.duration) : ''),
@@ -228,13 +309,33 @@ export class Discover {
   }
 
   // Openverse can draw a sound's outline. They are fetched a few at a time after the list shows.
+  // While a sound plays, a copy in the accent colour fills its outline up to where it is; a sound
+  // without an outline gets a line that fills the same way.
+  /** @param {Found} it */
   outline(it) {
     const { el } = this.h, box = el('span', { class: 'mini', 'aria-hidden': 'true' });
+    const playing = !!it.url && this.playingUrl === it.url;
+    let svg = '';
     if (it.wave?.length) {
       let d = ''; it.wave.forEach((m, i) => { const hgt = Math.max(1, m / 255 * 24); d += `M${i + 0.5} ${((24 - hgt) / 2).toFixed(1)}v${hgt.toFixed(1)}`; });
-      box.innerHTML = `<svg viewBox="0 0 ${it.wave.length} 24" preserveAspectRatio="none"><path d="${d}"/></svg>`;
-    }
+      svg = `<svg viewBox="0 0 ${it.wave.length} 24" preserveAspectRatio="none"><path d="${d}"/></svg>`;
+    } else if (playing) svg = '<svg viewBox="0 0 100 24" preserveAspectRatio="none"><path class="track" d="M0 12H100"/></svg>';
+    if (playing) { box.dataset.url = /** @type {string} */ (it.url); svg += `<span class="mini-played">${svg}</span>`; }
+    box.innerHTML = svg;
     return box;
+  }
+  // Moves the fill along while the sound `id` plays, from engine time t0 over `dur` seconds.
+  /** @param {number} id @param {string} url @param {number} t0 @param {number} dur */
+  followPlay(id, url, t0, dur) {
+    const tick = () => {
+      if (this.voice !== id) return;
+      const f = Math.max(0, Math.min(1, (now() - t0) / dur));
+      for (const n of this.list.querySelectorAll('.mini[data-url] .mini-played')) {
+        if (/** @type {HTMLElement} */ (n.parentElement).dataset.url === url) /** @type {HTMLElement} */ (n).style.clipPath = `inset(0 ${((1 - f) * 100).toFixed(2)}% 0 0)`;
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
   }
   async loadOutlines() {
     if (this.source !== 'openverse' || this.outlining) return;
@@ -244,7 +345,7 @@ export class Discover {
       for (;;) {
         const next = this.items.filter(i => i.url && i.wave === undefined).slice(0, 3);
         if (!next.length || seq !== this.seq) break;
-        await Promise.all(next.map(async (it) => { it.wave = null; try { it.wave = await this.h.api('/api/discover/waveform', { json: { source: 'openverse', id: it.id } }); } catch { } }));
+        await Promise.all(next.map(async (it) => { it.wave = null; try { it.wave = await lib.discoverWaveform({ source: 'openverse', id: it.id }); } catch { } }));
         if (seq === this.seq) this.paint();
       }
     } finally { this.outlining = false; if (seq !== this.seq) this.loadOutlines(); }
@@ -253,13 +354,15 @@ export class Discover {
   // The results in the order on screen.
   shown() {
     if (!this.sort) return this.items;
+    /** @type {(a: Found, b: Found) => number} */
     const by = this.sort === 'name' ? (a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }) : (a, b) => (a.duration ?? Infinity) - (b.duration ?? Infinity);
     return [...this.items].sort(by);
   }
 
+  /** @param {KeyboardEvent} e */
   handleKey(e) {
     if (e.key === '/') { e.preventDefault(); this.q.focus(); return true; }
-    const k = e.key.toLowerCase(), it = this.shown()[this.cur];
+    const k = e.key.toLowerCase(), it = this.shown()[/** @type {number} */ (this.cur)];
     if (e.metaKey || e.ctrlKey || e.altKey) return false;
     if (this.items.length && (k === 'j' || e.key === 'ArrowDown' || k === 'k' || e.key === 'ArrowUp')) {
       e.preventDefault();
