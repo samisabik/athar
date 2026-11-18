@@ -1,9 +1,11 @@
 {
   "name": "athar-interface",
   "private": true,
-  "description": "Type checks for the interface in app/ui: strict, through JSDoc, with no build step.",
+  "type": "module",
+  "description": "Type checks and unit tests for the interface in app/ui: strict, through JSDoc, with no build step.",
   "scripts": {
-    "check": "tsc -p jsconfig.json"
+    "check": "tsc -p jsconfig.json",
+    "test": "node --test app/drive/"
   },
   "devDependencies": {
     "typescript": "5.9.3"

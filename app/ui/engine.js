@@ -5,8 +5,7 @@ const T = window.__TAURI_INTERNALS__;
 /** @param {string} cmd @param {unknown} [args] @param {{ headers?: Record<string, string> }} [opts] @returns {Promise<any>} */
 export const invoke = (cmd, args, opts) => T.invoke(cmd, args, opts);
 
-/** Calls cb with the payload of every `event` the native side sends. */
-/** @param {string} event @param {(payload: any) => void} cb */
+/** Calls cb with the payload of every `event` the native side sends. @param {string} event @param {(payload: any) => void} cb */
 export function listen(event, cb) {
   return invoke('plugin:event|listen', { event, target: { kind: 'Any' }, handler: T.transformCallback((e) => cb(e.payload)) });
 }
@@ -16,14 +15,35 @@ export let rate = 48000;
 /** @type {Map<number, () => void>} */
 const waiting = new Map();
 
-// The engine sends its clock a few times a second, and at once when sounds end.
-listen('engine', (/** @type {{ now: number, rate: number, ended: number[] }} */ s) => {
+// Why there is no sound output (no device, a stream that would not open), or null when there is one.
+/** @type {string | null} */
+let outputError = null;
+/** @type {((error: string | null) => void) | null} */
+let outputListener = null;
+/** @param {string | null | undefined} error */
+function reportOutput(error) {
+  if ((error ?? null) === outputError) return;
+  outputError = error ?? null;
+  outputListener?.(outputError);
+}
+/** Calls f with the reason there is no sound output, at once when one is known and again whenever it changes; null means the output works. @param {(error: string | null) => void} f */
+export function onOutputError(f) { outputListener = f; if (outputError) f(outputError); }
+
+/** @param {{ now: number, rate: number, error?: string | null }} s */
+function sync(s) {
   base = { t: s.now, at: performance.now() }; rate = s.rate || rate;
+  // The clock event carries no error on a native side that does not send one; nothing is known then.
+  if ('error' in s) reportOutput(s.error);
+}
+
+// The engine sends its clock a few times a second, and at once when sounds end.
+listen('engine', (/** @type {{ now: number, rate: number, ended: number[], error?: string | null }} */ s) => {
+  sync(s);
   for (const id of s.ended) { const f = waiting.get(id); waiting.delete(id); f?.(); }
 });
 // A page that starts fresh, after a launch or a reload, starts in silence.
 invoke('audio_reset').catch(() => { });
-invoke('audio_info').then((s) => { base = { t: s.now, at: performance.now() }; rate = s.rate || rate; }).catch(() => { });
+invoke('audio_info').then(sync).catch(() => { });
 
 /** The engine's clock in seconds, counted on from its last report; it never runs backwards. */
 export function now() {
@@ -31,19 +51,20 @@ export function now() {
   return last;
 }
 
-/** Calls f once the sound `id` has finished playing. */
-/** @param {number} id @param {() => void} f */
+/** Calls f once the sound `id` has finished playing. @param {number} id @param {() => void} f */
 export function onEnded(id, f) { waiting.set(id, f); }
-/** @param {number} id */
+/** Drops what onEnded was given for `id`. @param {number} id */
 export function forget(id) { waiting.delete(id); }
 
 export const setVolume = (/** @type {number} */ v) => invoke('audio_volume', { v }).catch(() => { });
 
-/** Plays a sound the engine holds (`key`) from `offset` seconds; resolves with its id. */
-/** @param {string} key @param {{ offset?: number, duration?: number | null, loop?: [number, number] | null }} [o] @returns {Promise<number>} */
+/**
+ * Plays a sound the engine holds (`key`) from `offset` seconds; resolves with its id.
+ * @param {string} key @param {{ offset?: number, duration?: number | null, loop?: [number, number] | null }} [o] @returns {Promise<number>}
+ */
 export async function play(key, { offset = 0, duration = null, loop = null } = {}) {
   const id = Math.floor(Math.random() * 2 ** 31) + 2 ** 32;
-  await invoke('audio_start', { req: { id, sound: key, when: 0, offset, duration, looped: loop, chain: [] } });
+  await invoke('audio_start', { req: { id, sound: key, offset, duration, looped: loop } });
   return id;
 }
-export const stop = (/** @type {number} */ id) => { forget(id); return invoke('audio_stop', { id, when: 0 }).catch(() => { }); };
+export const stop = (/** @type {number} */ id) => { forget(id); return invoke('audio_stop', { id }).catch(() => { }); };

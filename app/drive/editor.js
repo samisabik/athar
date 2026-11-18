@@ -1,3 +1,6 @@
+// The editor: playing and looping, edits with undo and redo, regions, a tool's audition, the
+// compressor and the live EQ, the spectrogram, saving, and the preview player. Needs a library
+// with a sound named tone_440*.
 const { lib } = await import('/static/native.js');
 const E = await import('/static/engine.js');
 const inv = E.invoke, lvl = async () => +(await inv('audio_poll')).level.toFixed(3);
@@ -7,7 +10,7 @@ const files = await lib.search({ sort: 'name', limit: 500 });
 const tone = files.find(f => f.name.startsWith('tone_440'));
 const ed = window.athar.editor;
 document.querySelector('.ab[data-view="editor"]').click(); await wait(300);
-await ed.load({ source: { path: tone.path }, name: tone.name, dir: '/tmp', path: tone.path });
+await ed.load({ source: { path: tone.path }, name: tone.name, dir: '/tmp' });
 await wait(800);
 log({ loaded: ed.loaded, len: ed.length, sr: ed.sr, nch: ed.nch, layer: !!ed.layerKey, info: ed.$('[data-f=info]').textContent });
 ed.loop = true; await ed.play(); await wait(600);
@@ -44,10 +47,10 @@ log({ fx_view: ed.fx.displayView(), info: ed.fx.root.querySelector('.fx-info')?.
 await ed.fx.apply(); log({ applied_undo: ed.undoN, peak_after: +(await inv('ed_analyse', { p: { kind: 'peak' } })).toFixed(3) });
 await ed.fx.close();
 // EQ live
-await ed.fx.open('eq'); ed.fx.bands.push({ type: 'bell', f: 440, g: -18, q: 1, on: true }); ed.fx.bypass = false; ed.fx.bandChanged(true);
-await ed.play(); await wait(700);
-const eqLevel = await lvl(); ed.fx.drawEq(); await wait(400);
-log({ eq_live: ed.fx.liveEq(), eq_level: eqLevel, curves: !!ed.fx.curves, spectrum_peak: Math.max(...ed.fx.readSpectrum()).toFixed(1) });
+await ed.fx.open('eq'); ed.fx.bands.push({ type: 'bell', f: 440, g: -18, q: 1, on: true }); ed.fx.bypass = false; ed.fx.bandChanged();
+ed.cursor = 0; await ed.play(); await wait(700);
+const eqLevel = +(await inv('audio_poll')).level.toFixed(4); ed.fx.drawEq(); await wait(400);
+log({ eq_live: ed.fx.eqLive, eq_level: eqLevel, curves: !!ed.fx.curves, spectrum_peak: Math.max(...ed.fx.spectrum).toFixed(1) });
 ed.stopPlay(); ed.fx.bands = []; ed.fx.touched = false; await ed.fx.close();
 // spectrogram
 await ed.action('view'); await wait(1500); log({ spec_tiles: ed.tiles?.map.size }); await ed.action('view');

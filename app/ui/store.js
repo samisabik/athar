@@ -3,7 +3,7 @@
 
 /** @type {import('./search.js').LibState} */
 export const state = {
-  query: '', category: null, folder: null, under: null, subs: [], project: null, tag: null, minRating: null,
+  query: '', category: null, folder: null, under: null, project: null, tag: null, minRating: null,
   sort: 'score', items: [], selected: -1, projects: [], indexed: -1,
   currentView: 'sounds',
   /** The sound shown on the card. */

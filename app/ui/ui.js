@@ -4,7 +4,18 @@ import { app } from './native.js';
 
 /** An element of the page that is always there, by its selector. @param {string} s @returns {any} */
 export const $ = (s) => document.querySelector(s);
-export const pickFolder = (title = 'Choose a folder', start = '') => app.pickFolder(start);
+/** Asks for a folder with a picker titled `title` (what the folder is for), starting in `start`;
+    resolves its path, or null when cancelled.
+    @param {string} [title] @param {string} [start] @returns {Promise<string | null>} */
+export const pickFolder = (title = '', start = '') => app.pickFolder(title, start);
+
+export const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// Small choices the window keeps between launches (a panel left open, the last project picked).
+/** @param {string} key @param {string | null} value null forgets it */
+export function remember(key, value) { try { value == null ? localStorage.removeItem(key) : localStorage.setItem(key, value); } catch { } }
+/** @param {string} key @returns {string | null} */
+export function recall(key) { try { return localStorage.getItem(key); } catch { return null; } }
 
 // Every message goes to the one bar at the bottom of the window: short confirmations, notices
 // that stay a little longer, and (below them, for as long as it lasts) progress or a problem.
@@ -60,10 +71,30 @@ export function focusable(n, activate) {
   return n;
 }
 
-export const NEEDS_LABEL = '[data-tip]:is(button, select, input):not([aria-label])';
-export const labelFromTip = (/** @type {Element} */ n) => n.setAttribute('aria-label', n.dataset.tip || '');
+// Types phrases into an empty search box as its placeholder: one is typed out, held, wiped, then
+// the next. `next` gives each phrase. Returns what stops the typing.
+/** @param {HTMLInputElement} input @param {() => string} next @returns {() => void} */
+export function typePlaceholder(input, next) {
+  /** @type {number | undefined} */
+  let timer;
+  let phrase = '', n = 0, wiping = false;
+  const step = () => {
+    if (!wiping && n === 0) phrase = next();
+    n += wiping ? -2 : 1;
+    if (n >= phrase.length) { n = phrase.length; wiping = true; input.placeholder = phrase; timer = setTimeout(step, 1900); return; }
+    if (n <= 0) { n = 0; wiping = false; }
+    input.placeholder = phrase.slice(0, n) || ' ';
+    timer = setTimeout(step, wiping ? 18 : 55 + Math.random() * 50);
+  };
+  step();
+  return () => clearTimeout(timer);
+}
+
+// A control that has a tooltip and no label of its own is named by its tooltip.
+const NEEDS_LABEL = '[data-tip]:is(button, select, input):not([aria-label])';
+const labelFromTip = (/** @type {Element} */ n) => n.setAttribute('aria-label', n.dataset.tip || '');
 /** @param {Element | Document} root */
-export function labelControls(root) {
+function labelControls(root) {
   if ('matches' in root && root.matches(NEEDS_LABEL)) labelFromTip(root);
   root.querySelectorAll(NEEDS_LABEL).forEach(labelFromTip);
 }
@@ -72,11 +103,15 @@ new MutationObserver((muts) => {
   for (const m of muts) for (const n of m.addedNodes) if (n.nodeType === 1) labelControls(/** @type {Element} */ (n));
 }).observe($('#editor'), { childList: true, subtree: true });
 
+// There is one dialog. Opening another while it shows cancels the one showing first.
+/** @type {(() => void) | null} */
+let cancelOpenDialog = null;
 /** Shows the dialog with `nodes`; resolves what `value()` gives on OK, 'alt' for the other
     button, or null.
     @template T @param {string} title @param {Node[]} nodes @param {HTMLElement | null} first @param {string} okLabel @param {() => T} value @param {string | null} [altLabel]
     @returns {Promise<T | 'alt' | null>} */
 export function dialog(title, nodes, first, okLabel, value, altLabel = null) {
+  cancelOpenDialog?.();
   return new Promise((resolve) => {
     const box = $('#modal'), card = box.querySelector('.modal-card'), ok = $('#modalOk'), cancel = $('#modalCancel'), alt = $('#modalAlt');
     alt.hidden = !altLabel; alt.textContent = altLabel || '';
@@ -87,6 +122,7 @@ export function dialog(title, nodes, first, okLabel, value, altLabel = null) {
     box.hidden = false;
     (first || ok).focus();
     const done = (/** @type {T | 'alt' | null} */ v) => {
+      cancelOpenDialog = null;
       box.hidden = true; ok.onclick = cancel.onclick = alt.onclick = null;
       document.removeEventListener('keydown', key, true);
       if (back?.isConnected) back.focus();
@@ -104,6 +140,7 @@ export function dialog(title, nodes, first, okLabel, value, altLabel = null) {
       e.preventDefault(); e.stopPropagation();
     };
     document.addEventListener('keydown', key, true);
+    cancelOpenDialog = () => done(null);
     ok.onclick = () => done(value());
     cancel.onclick = () => done(null);
     alt.onclick = () => done('alt');

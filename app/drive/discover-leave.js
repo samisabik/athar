@@ -1,3 +1,5 @@
+// Discover: a long sound shows how much has arrived while it is fetched, and leaving the page
+// silences it. Needs the network.
 const E = await import('/static/engine.js'); const { lib } = await import('/static/native.js'); await E.setVolume(0.05);
 const lvl = async () => +(await E.invoke('audio_poll')).level.toFixed(3);
 document.querySelector('.ab[data-view="discover"]').click(); await wait(800);

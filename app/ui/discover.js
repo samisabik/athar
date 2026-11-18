@@ -1,6 +1,10 @@
+import { el, ib, icon, notice, fail, modal, focusable, reduceMotion, remember, recall, typePlaceholder } from './ui.js';
 import { lib } from './native.js';
 import { invoke, listen, now, play as playSound, stop as stopSound, onEnded } from './engine.js';
 import { fmtTime } from './time.js';
+import { baseOf } from './names.js';
+import { registerPlayer, stopOthers } from './players.js';
+import { chooseProjectFolder, refreshSide } from './sidebar.js';
 
 // Ideas for the dice. Archives match titles and tags, so these stay short and concrete.
 const IDEAS = `
@@ -27,29 +31,22 @@ function nextIdea() {
 }
 const HELLOS = ['What have you never heard?', 'Go find something strange.', 'Dig somewhere new.', 'What is out there?', 'Borrow a sound from the world.', 'Somebody recorded this.', 'Find a sound nobody else has.'];
 const PLACEHOLDER = 'Search free sound archives';
-const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const DEST_KEY = 'athar-discover-project', SOURCE_KEY = 'athar-discover-source';
-const remember = (/** @type {string} */ k, /** @type {string | null} */ v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch { } };
-const recall = (/** @type {string} */ k) => { try { return localStorage.getItem(k); } catch { return null; } };
 const mb = (/** @type {number | undefined} */ n) => n ? `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MB` : '';
 
-/** @typedef {typeof import('./ui.js')} UI */
 /** @typedef {{ id: string, name: string }} Source */
 /** A sound an archive found. One without a url holds several recordings, listed by discover_files.
     @typedef {{ id: string | number, title: string, creator?: string, url?: string | null, duration?: number | null, license?: string, via?: string, page?: string, wave?: number[] | null }} Found */
 /** @typedef {{ name: string, url: string, duration?: number | null, size?: number }} FoundFile */
-/** @typedef {{ id: number, name: string, folder?: string | null }} Project */
+/** @typedef {import('./search.js').Project} Project */
 /** @typedef {{ key: string, partial: boolean, duration: number }} Preview */
-/** What the page uses from main.js.
-    @typedef {{ el: UI['el'], ib: UI['ib'], icon: UI['icon'], notice: UI['notice'], fail: UI['fail'], modal: UI['modal'], focusable: UI['focusable'],
-      projectFolder(p: Project): Promise<unknown>, volume(): number, stopOthers?(): void, onAdd?(): void }} DiscoverHelpers */
-
 /** Search of free online sound archives. A found sound plays from the archive; adding it
     downloads it into a library folder with its licence and origin in the note. */
 export class Discover {
-  /** @param {HTMLElement} root @param {DiscoverHelpers} h */
-  constructor(root, h) {
-    this.root = root; this.h = h;
+  /** @param {HTMLElement} root */
+  constructor(root) {
+    this.root = root;
+    registerPlayer('discover', () => this.stop());
     /** @type {Source[]} */
     this.sources = []; this.source = recall(SOURCE_KEY) || 'openverse';
     /** @type {Found[]} */
@@ -91,14 +88,13 @@ export class Discover {
     /** @type {boolean | undefined} */ this.toldPartial;
     /** @type {boolean | undefined} */ this.outlining;
     /** @type {string | null | undefined} */ this.idea;
-    /** @type {ReturnType<typeof setTimeout> | undefined} */ this.typing;
+    /** Stops the ideas being typed into the empty search box. @type {(() => void) | null} */ this.stopTyping = null;
     /** @type {number | undefined} */ this.cur;
     /** @type {'name' | 'duration' | null | undefined} */ this.sort;
     this.build();
   }
 
   build() {
-    const { el, ib, icon } = this.h;
     this.hello = el('div', { class: 'hello', 'aria-hidden': 'true' });
     this.q = el('input', { placeholder: PLACEHOLDER, spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Search free sound archives' });
     this.q.onkeydown = (e) => {
@@ -137,12 +133,12 @@ export class Discover {
   }
   async chooseDest() {
     await this.checkDest();
-    if (!this.projects.length) { this.h.notice('Create a project on the Projects page first. Found sounds are added to a project.'); return null; }
-    const pick = await this.h.modal('Add found sounds to', [{ label: 'Project', options: this.projects.map(p => [String(p.id), p.folder ? p.name : `${p.name} (needs a folder)`]), value: this.dest || undefined }]);
+    if (!this.projects.length) { notice('Create a project on the Projects page first. Found sounds are added to a project.'); return null; }
+    const pick = await modal('Add found sounds to', [{ label: 'Project', options: this.projects.map(p => [String(p.id), p.folder ? p.name : `${p.name} (needs a folder)`]), value: this.dest || undefined }]);
     if (!pick) return null;
     const p = /** @type {Project} */ (this.projects.find(x => String(x.id) === pick[0]));
     // The download has to land somewhere on disk, so a project without a folder gets one now.
-    if (!p.folder && !await this.h.projectFolder(p)) return null;
+    if (!p.folder && !await chooseProjectFolder(p)) return null;
     this.dest = pick[0]; remember(DEST_KEY, this.dest);
     await this.checkDest();
     this.paint();
@@ -154,23 +150,12 @@ export class Discover {
   setIdle(idle) {
     if (this.root.classList.contains('idle') === idle) return;
     this.root.classList.toggle('idle', idle);
-    clearTimeout(this.typing);
+    this.stopTyping?.(); this.stopTyping = null;
     if (!idle) { this.q.placeholder = PLACEHOLDER; this.idea = null; return; }
     this.hello.textContent = HELLOS[Math.floor(Math.random() * HELLOS.length)];
-    const any = nextIdea;
-    if (reduceMotion || !this.visible) { this.q.placeholder = this.idea = any(); return; }
-    let phrase = '', n = 0, wiping = false;
-    const step = () => {
-      if (!wiping && n === 0) phrase = this.idea = any();
-      n += wiping ? -2 : 1;
-      if (n >= phrase.length) { n = phrase.length; wiping = true; this.q.placeholder = phrase; this.typing = setTimeout(step, 1900); return; }
-      if (n <= 0) { n = 0; wiping = false; }
-      this.q.placeholder = phrase.slice(0, n) || ' ';
-      this.typing = setTimeout(step, wiping ? 18 : 55 + Math.random() * 50);
-    };
-    step();
+    if (reduceMotion || !this.visible) this.q.placeholder = this.idea = nextIdea();
+    else this.stopTyping = typePlaceholder(this.q, () => this.idea = nextIdea());
   }
-
 
   /** @param {string} query */
   async search(query, page = 1) {
@@ -184,7 +169,7 @@ export class Discover {
       if (seq !== this.seq) return;
       this.items = page === 1 ? r.items : [...this.items, ...r.items];
       this.page = page; this.more = r.more;
-    } catch (e) { if (seq === this.seq) this.h.fail(e); }
+    } catch (e) { if (seq === this.seq) fail(e); }
     finally { if (seq === this.seq) { this.loading = false; this.paint(); this.loadOutlines(); } }
   }
 
@@ -197,7 +182,7 @@ export class Discover {
       /** @type {FoundFile[]} */
       const files = (await lib.discoverFiles({ source: this.source, id: it.id })).filter((/** @type {FoundFile} */ f) => !seen.has(f.url) && seen.add(f.url));
       if (this.open.has(it.id)) this.open.set(it.id, files);
-    } catch (e) { this.open.delete(it.id); this.h.fail(e); }
+    } catch (e) { this.open.delete(it.id); fail(e); }
     this.paint();
   }
 
@@ -205,7 +190,7 @@ export class Discover {
   async play(url) {
     if (this.playingUrl === url) return this.stop();
     this.stop();
-    this.h.stopOthers?.();
+    stopOthers('discover');
     // Archives can take several seconds to send a file, so the button shows the wait.
     this.playingUrl = url; this.waiting = true;
     this.paint();
@@ -213,7 +198,7 @@ export class Discover {
       const duration = this.items.find(i => i.url === url)?.duration ?? [...this.open.values()].flat().find(f => f?.url === url)?.duration ?? null;
       if (!this.fetched.has(url)) this.fetched.set(url, invoke('discover_preview', { url, duration }));
       const { key, partial } = /** @type {Preview} */ (await this.fetched.get(url));
-      if (partial && !this.toldPartial) { this.toldPartial = true; this.h.notice('Long sounds preview their first part, so they start sooner. Add fetches the whole sound.', 6000); }
+      if (partial && !this.toldPartial) { this.toldPartial = true; notice('Long sounds preview their first part, so they start sooner. Add fetches the whole sound.', 6000); }
       if (this.playingUrl !== url) return;
       let id;
       try { id = await playSound(key); }
@@ -224,7 +209,7 @@ export class Discover {
       onEnded(id, () => { if (this.voice === id) { this.voice = null; this.playingUrl = null; this.paint(); } });
     } catch (e) {
       this.fetched.delete(url);
-      if (this.playingUrl === url) { this.h.notice(String(/** @type {Error} */ (e)?.message || e) || 'That sound could not be played from the archive'); this.stop(); }
+      if (this.playingUrl === url) { notice(String(/** @type {Error} */ (e)?.message || e) || 'That sound could not be played from the archive'); this.stop(); }
     }
   }
   stop() {
@@ -235,7 +220,7 @@ export class Discover {
   }
   /** Back to the landing: called when the page is left, so it opens fresh next time. */
   reset() {
-    this.stop(); this.seq++; this.visible = false; clearTimeout(this.typing);
+    this.stop(); this.seq++; this.visible = false; this.stopTyping?.(); this.stopTyping = null;
     this.query = ''; this.items = []; this.more = false; this.sort = null; this.loading = false; this.page = 1; this.open.clear();
     this.q.value = '';
     this.paint();
@@ -254,14 +239,13 @@ export class Discover {
     try {
       const r = await lib.discoverSave({ url, title: file ? file.name : it.title, project: +dest, note, source: this.source });
       this.added.add(url);
-      this.h.notice(`Added ${r.path.split('/').pop()} to ${this.projects.find(p => String(p.id) === dest)?.name || 'the project'}`);
-      this.h.onAdd?.();
-    } catch (e) { this.h.fail(e); }
+      notice(`Added ${baseOf(r.path)} to ${this.projects.find(p => String(p.id) === dest)?.name || 'the project'}`);
+      refreshSide();
+    } catch (e) { fail(e); }
     finally { this.busy.delete(url); this.paint(); }
   }
 
   paint() {
-    const { el, ib, icon } = this.h;
     if (this.sourceSel.options.length !== this.sources.length) this.sourceSel.replaceChildren(...this.sources.map(x => el('option', { value: x.id }, x.name)));
     this.sourceSel.value = this.source;
     this.scope.textContent = this.loading ? 'Searching' : this.items.length ? `${this.items.length}${this.more ? '+' : ''} found for "${this.query}"` : '';
@@ -281,13 +265,13 @@ export class Discover {
     // Column names sort what has been loaded so far; a second click goes back to the archive's own order.
     const head = (/** @type {string} */ label, /** @type {'name' | 'duration'} */ key) => {
       const on = this.sort === key, flip = () => { this.sort = on ? null : key; this.cur = 0; this.paint(); };
-      return this.h.focusable(el('span', { class: 'th sortable' + (on ? ' on' : ''), role: 'button', 'data-tip': on ? 'Back to best match first' : `Sort by ${label}`, onclick: flip }, label), flip);
+      return focusable(el('span', { class: 'th sortable' + (on ? ' on' : ''), role: 'button', 'data-tip': on ? 'Back to best match first' : `Sort by ${label}`, onclick: flip }, label), flip);
     };
     if (this.items.length) rows.push(el('div', { class: 'disc-row disc-head' }, el('span'), el('span'), head('name', 'name'), head('length', 'duration'), el('span')));
     for (const it of this.shown()) {
       const multi = !it.url, files = this.open.get(it.id), opened = this.open.has(it.id);
       const act = multi ? () => this.toggleFiles(it) : () => this.play(/** @type {string} */ (it.url));
-      rows.push(this.h.focusable(el('div', { class: 'disc-row' + (opened ? ' on' : '') + (this.shown()[/** @type {number} */ (this.cur)] === it ? ' cur' : ''), onclick: () => { this.cur = this.shown().indexOf(it); act(); }, 'data-tip': multi ? 'Click to see the recordings inside' : null },
+      rows.push(focusable(el('div', { class: 'disc-row' + (opened ? ' on' : '') + (this.shown()[/** @type {number} */ (this.cur)] === it ? ' cur' : ''), onclick: () => { this.cur = this.shown().indexOf(it); act(); }, 'data-tip': multi ? 'Click to see the recordings inside' : null },
         multi ? ib(opened ? 'expand_more' : 'chevron_right', 'Show the recordings inside', (e) => { e.stopPropagation(); act(); }) : playBtn(/** @type {string} */ (it.url)),
         this.outline(it),
         el('span', { class: 'qn' }, it.title, it.creator ? el('span', { class: 'qsub' }, it.creator) : null),
@@ -314,7 +298,7 @@ export class Discover {
   // without an outline gets a line that fills the same way.
   /** @param {Found} it */
   outline(it) {
-    const { el } = this.h, box = el('span', { class: 'mini', 'aria-hidden': 'true' });
+    const box = el('span', { class: 'mini', 'aria-hidden': 'true' });
     const playing = !!it.url && this.playingUrl === it.url;
     let svg = '';
     if (it.wave?.length) {

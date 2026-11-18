@@ -1,12 +1,15 @@
 // Search, the results list, and the Library before any search.
 
-import { $, el, ib, icon, fail, toast, modal, confirmModal, focusable } from './ui.js';
+import { $, el, ib, icon, fail, toast, modal, confirmModal, focusable, reduceMotion, typePlaceholder } from './ui.js';
 import { fmtTime } from './time.js';
 import { lib } from './native.js';
 import { state } from './store.js';
 import { SETTINGS } from './settings.js';
-import { reduceMotion } from './cat.js';
-import { loadCats, loadFolders, loadProjects } from './sidebar.js';
+import { baseOf, plural } from './names.js';
+import { projectOf, placeChip } from './places.js';
+import { isPlaying, togglePreview, stopPreview } from './preview.js';
+import { openPath } from './editing.js';
+import { hasFolders, loadCats, loadFolders, loadProjects, refreshSide } from './sidebar.js';
 import { loadTags, renderCard } from './card.js';
 
 /** A sound of the Library, as a search returns it.
@@ -20,35 +23,29 @@ import { loadTags, renderCard } from './card.js';
     @typedef {{ query: string, category: string | null, folder: string | null, under: string | null, project: number | null,
       tag: string | null, minRating: number | string | null, sort: string, items: Item[], selected: number, projects: Project[],
       currentView: string, cardItem: Item | null, allTags: { tag: string, count: number }[], libLoop: boolean,
-      subs: Sub[], indexed: number, playingItem: Item | null }} LibState */
-/** What main.js provides to these pages.
-    @typedef {{ isPlaying: (it: Item | null | undefined) => boolean, openPath: (it: Item) => Promise<void>,
-      togglePreview: (it: Item, forceStart?: boolean) => void, stopPreview: () => void, refreshSide: () => void,
-      placeChip: (it: Item) => HTMLElement, originChip: (it: Item) => HTMLElement | null, projectOf: (path: string) => Project | null,
-      trashSound: (it: Item) => Promise<void>, showView: (name: string) => void, batch: (items: Item[]) => Promise<void> }} Main */
+      indexed: number, playingItem: Item | null }} LibState */
 
-
-// What search uses from the rest of the window; main.js fills these in.
-export const host = /** @type {Pick<Main, 'isPlaying' | 'openPath' | 'placeChip' | 'projectOf' | 'refreshSide' | 'stopPreview' | 'togglePreview'>} */ ({});
 // ---------- search
 let searchSeq = 0;
-export const SORTS = ['name', 'duration', 'category', 'rating', 'recorded'];
-export const hasQuery = () => !!state.query;
-export const hasFilter = () => !!(state.folder || state.project || state.category || state.tag || state.minRating);
+const SORTS = ['name', 'duration', 'category', 'rating', 'recorded'];
+const hasQuery = () => !!state.query;
+const hasFilter = () => !!(state.folder || state.project || state.category || state.tag || state.minRating);
 
-export function filters() {
+const RESULTS_LIMIT = 500;
+// What the search is asked for besides the words. Without words there is no best match to sort
+// by, so the sort chosen in Settings takes its place.
+function filters() {
   const { default_sort } = SETTINGS;
   const defaultSort = SORTS.includes(default_sort) ? default_sort : 'name';
   return {
     category: state.category, folder: state.folder, under: state.folder ? state.under : null, project: state.project,
-    min_dur: null,
     tag: state.tag || null, min_rating: state.minRating || null,
     sort: state.sort === 'score' && !hasQuery() ? defaultSort : state.sort,
-    limit: 500,
+    limit: RESULTS_LIMIT,
   };
 }
 
-export function updateFilterBadge() {
+function updateFilterBadge() {
   const n = [state.category, state.tag, state.minRating].filter(Boolean).length;
   const b = $('#filterCount'); b.hidden = !n; b.textContent = n;
   for (const id of ['catFilter', 'tagFilter', 'ratingFilter']) {
@@ -78,13 +75,13 @@ export async function search() {
 export function scopeText() {
   const n = state.items.length;
   if (!n) return '';
-  return `${n} sound${n === 1 ? '' : 's'}` + (state.query ? ` · like "${state.query}"` : '');
+  return plural(n, 'sound') + (state.query ? ` · like "${state.query}"` : '');
 }
 
-export function renderChips() {
+function renderChips() {
   const box = $('#chips'); box.innerHTML = '';
   const chips = /** @type {[string, string, () => Promise<void> | undefined][]} */ ([
-    state.folder && ['folder', state.folder.split('/').pop(), () => { state.folder = null; state.under = null; return loadFolders(); }],
+    state.folder && ['folder', baseOf(state.folder), () => { state.folder = null; state.under = null; return loadFolders(); }],
     state.category && ['category', state.category, () => { state.category = null; return loadCats(); }],
     state.tag && ['sell', state.tag, () => { state.tag = null; $('#tagFilter').value = ''; }],
     state.minRating && ['star', `${state.minRating}+`, () => { state.minRating = null; $('#ratingFilter').value = ''; }],
@@ -100,18 +97,18 @@ export function renderChips() {
 }
 
 // The folder chip reads as a path: each part goes back up to that level.
-export function folderCrumbs() {
+function folderCrumbs() {
   const root = /** @type {string} */ (state.folder), parts = state.under ? state.under.slice(root.length + 1).split('/') : [];
   const go = (/** @type {string | null} */ under) => () => { state.under = under; search(); };
   /** @type {HTMLElement[]} */
-  const out = [el('button', { class: 'crumb', onclick: go(null) }, root.split('/').pop())];
+  const out = [el('button', { class: 'crumb', onclick: go(null) }, baseOf(root))];
   parts.forEach((p, i) => out.push(el('span', { class: 'crumb-sep' }, '/'),
     el('button', { class: 'crumb', onclick: go(`${root}/${parts.slice(0, i + 1).join('/')}`) }, p)));
   return out;
 }
 
 let subsSeq = 0;
-export async function renderSubs() {
+async function renderSubs() {
   const box = $('#subs'), at = state.folder && (state.under || state.folder), seq = ++subsSeq;
   /** @type {Sub[]} */
   let subs = [];
@@ -125,7 +122,7 @@ export async function renderSubs() {
   box.hidden = !subs.length;
 }
 
-export function render() {
+function render() {
   renderChips();
   $('#scope').textContent = scopeText();
   renderList();
@@ -137,7 +134,7 @@ export function renderList() {
   const box = $('#results'), lib = $('.lib');
   const had = box.contains(document.activeElement) ? (document.activeElement?.dataset.sort || 'row') : null;
   box.innerHTML = '';
-  const noFolders = !$('#folders').querySelector('.item'), idle = !hasQuery() && !hasFilter();
+  const noFolders = !hasFolders(), idle = !hasQuery() && !hasFilter();
   lib.classList.toggle('blank', noFolders);
   lib.classList.toggle('idle', idle);
   syncIdleSearch();
@@ -162,46 +159,38 @@ export function dropZone() {
 
 // ---------- the Library before any search: the search box sits in the middle of the page under a
 // line picked at random, and its placeholder types out things to look for.
-export const HELLOS = ['What does it sound like?', 'Say it in words.', 'What are you hearing?', 'Name that noise.', 'Go on, describe it.', 'Looking for a noise?', 'What should it sound like?', 'Hum it in words.'];
-export const TRY_PHRASES = [
+const HELLOS = ['What does it sound like?', 'Say it in words.', 'What are you hearing?', 'Name that noise.', 'Go on, describe it.', 'Looking for a noise?', 'What should it sound like?', 'Hum it in words.'];
+const TRY_PHRASES = [
   'rain on a tin roof', 'lonely metallic ping', 'fat sub kick', 'dusty vinyl crackle', 'crowd in a big hall', 'wooden door creak',
   'birds at dawn', 'glass breaking', 'warm tape hiss', 'tight snare with a ring', 'distant thunder', 'footsteps on gravel',
   'metal scrape', 'soft synth pad', 'train passing', 'water dripping in a cave', 'something angry', 'something tiny', 'underwater',
   'a room with nobody in it', 'engine starting', 'bell far away', 'paper tearing', 'low hum',
 ];
-export const PLACEHOLDER = 'Describe a sound';
-let typing = 0;
+const PLACEHOLDER = 'Describe a sound';
+const anyOf = (/** @type {string[]} */ list) => list[Math.floor(Math.random() * list.length)];
+/** @type {(() => void) | null} */
+let stopTyping = null;
 // The search box stays in the middle until a search finds something.
 export function syncIdleSearch() { setIdleSearch(!state.items.length && !hasFilter()); }
 /** @param {boolean} idle */
-export function setIdleSearch(idle) {
+function setIdleSearch(idle) {
   const view = $('.view[data-view=sounds]');
   if (view.classList.contains('idle') === idle) return;
   view.classList.toggle('idle', idle);
-  clearTimeout(typing);
+  stopTyping?.(); stopTyping = null;
   const q = $('#q');
   if (!idle) { q.placeholder = PLACEHOLDER; return; }
-  $('#hello').textContent = HELLOS[Math.floor(Math.random() * HELLOS.length)];
-  if (reduceMotion) { q.placeholder = TRY_PHRASES[Math.floor(Math.random() * TRY_PHRASES.length)]; return; }
-  // Type a phrase, hold it, wipe it, then the next one.
-  let phrase = '', n = 0, wiping = false;
-  const step = () => {
-    if (!wiping && n === 0) phrase = TRY_PHRASES[Math.floor(Math.random() * TRY_PHRASES.length)];
-    n += wiping ? -2 : 1;
-    if (n >= phrase.length) { n = phrase.length; wiping = true; q.placeholder = phrase; typing = setTimeout(step, 1900); return; }
-    if (n <= 0) { n = 0; wiping = false; }
-    q.placeholder = phrase.slice(0, n) || ' ';
-    typing = setTimeout(step, wiping ? 18 : 55 + Math.random() * 50);
-  };
-  step();
+  $('#hello').textContent = anyOf(HELLOS);
+  if (reduceMotion) q.placeholder = anyOf(TRY_PHRASES);
+  else stopTyping = typePlaceholder(q, () => anyOf(TRY_PHRASES));
 }
 
-export function emptyState() {
+function emptyState() {
   if (!hasQuery() && !hasFilter()) return el('div');
   return el('div', { class: 'empty' }, el('h3', {}, 'Nothing matches'));
 }
 
-export const MINI_BARS = 48, MINI_H = 24;
+const MINI_BARS = 48, MINI_H = 24;
 
 // The sound's shape as one SVG path.
 /** @param {Item} it */
@@ -222,9 +211,9 @@ export function miniWave(it) {
 // Several sounds can be marked at once with Cmd-click and Shift-click; the bar above the list
 // then acts on all of them.
 /** @type {Set<string>} */
-export const marked = new Set();
+const marked = new Set();
 /** @param {{ metaKey?: boolean, ctrlKey?: boolean, shiftKey?: boolean }} e @param {number} i */
-export function rowClick(e, i) {
+function rowClick(e, i) {
   const it = state.items[i];
   if (e.metaKey || e.ctrlKey) {
     if (!marked.size && state.items[state.selected] && state.selected !== i) marked.add(state.items[state.selected].path);
@@ -238,7 +227,7 @@ export function rowClick(e, i) {
   if (marked.size) { marked.clear(); paintMarks(); }
   select(i, { scroll: false, play: true });
 }
-export function paintMarks() {
+function paintMarks() {
   for (const p of [...marked]) if (!state.items.some(x => x.path === p)) marked.delete(p);
   $('#results').querySelectorAll('.qitem[data-i]').forEach((/** @type {HTMLElement} */ r) => r.classList.toggle('marked', marked.has(state.items[Number(r.dataset.i)]?.path)));
   const bar = $('#markBar'), n = marked.size;
@@ -256,18 +245,18 @@ export function paintMarks() {
     if (ok) toast(done(ok));
   };
   const proj = el('select', { 'aria-label': 'Add the marked sounds to a project' }, el('option', { value: '' }, state.projects.length ? 'Add to project' : 'No projects yet'), state.projects.map(p => el('option', { value: p.id }, p.name)));
-  proj.onchange = () => { const pid = proj.value; if (pid) each(it => lib.projectItem(pid, { path: it.path }), k => `Copied ${k} sound${k === 1 ? '' : 's'} into the project`).then(() => loadProjects().catch(() => { })); };
+  proj.onchange = () => { const pid = proj.value; if (pid) each(it => lib.projectItem(pid, { path: it.path }), k => `Copied ${plural(k, 'sound')} into the project`).then(() => loadProjects().catch(() => { })); };
   const rate = el('select', { 'aria-label': 'Rate the marked sounds' }, el('option', { value: '' }, 'Rate'), [1, 2, 3, 4, 5, 0].map(k => el('option', { value: k }, k ? `${k}` : 'Clear rating')));
-  rate.onchange = () => { if (rate.value !== '') each(it => lib.catalog({ path: it.path, rating: +rate.value }), k => `Rated ${k} sound${k === 1 ? '' : 's'}`); };
+  rate.onchange = () => { if (rate.value !== '') each(it => lib.catalog({ path: it.path, rating: +rate.value }), k => `Rated ${plural(k, 'sound')}`); };
   bar.replaceChildren(el('span', { class: 'markn' }, `${n} marked`), proj, rate,
     ib('sell', 'Add tags to the marked sounds', async () => {
       const v = (await modal(`Tag ${n} sounds`, [{ label: 'Tags to add, separated by commas', placeholder: 'dusty, tape' }]))?.[0];
       const add = (v || '').split(',').map(t => t.trim()).filter(Boolean);
-      if (add.length) each(it => lib.catalog({ path: it.path, tags: [...new Set([...(it.tags || []), ...add])] }), k => `Tagged ${k} sound${k === 1 ? '' : 's'}`).then(() => loadTags().catch(() => { }));
+      if (add.length) each(it => lib.catalog({ path: it.path, tags: [...new Set([...(it.tags || []), ...add])] }), k => `Tagged ${plural(k, 'sound')}`).then(() => loadTags().catch(() => { }));
     }),
     ib('delete', 'Move the marked files to the Trash', async () => {
       if (!await confirmModal(`Delete ${n} files?`, 'This deletes the files themselves, not just their place in Athar. They go to the Trash.', 'Delete')) return;
-      host.stopPreview(); each(it => lib.trash({ path: it.path }), k => `Moved ${k} file${k === 1 ? '' : 's'} to the Trash`).then(() => host.refreshSide());
+      stopPreview(); each(it => lib.trash({ path: it.path }), k => `Moved ${plural(k, 'file')} to the Trash`).then(refreshSide);
     }),
     ib('close', 'Clear the marks', () => { marked.clear(); paintMarks(); }));
 }
@@ -276,15 +265,16 @@ export function paintMarks() {
 export function row(it, i, width) {
   /** @param {MouseEvent} [e] */
   const activate = (e) => rowClick(e || {}, i);
+  const inProject = !!projectOf(it.path);
   const r = el('div', {
-    class: 'qitem trow' + (i === state.selected ? ' on' : '') + (host.isPlaying(it) ? ' playing' : '') + (marked.has(it.path) ? ' marked' : ''),
+    class: 'qitem trow' + (i === state.selected ? ' on' : '') + (isPlaying(it) ? ' playing' : '') + (marked.has(it.path) ? ' marked' : ''),
     'data-i': i, tabindex: i === state.selected ? '0' : '-1', 'data-tip': 'Double-click to edit',
-    onclick: activate, ondblclick: () => host.openPath(it),
+    onclick: activate, ondblclick: () => openPath(it),
     onkeydown: (/** @type {KeyboardEvent} */ e) => { if (e.key === 'Enter' && e.target === e.currentTarget) { e.preventDefault(); e.stopPropagation(); activate(); } },
   },
   miniWave(it),
-  el('span', { class: 'qn' }, it.name, host.projectOf(it.path) ? null : subLabel(it)),
-  el('span', { class: 'rtags' }, host.projectOf(it.path) && !state.project ? host.placeChip(it) : null, (it.tags || []).map(t => el('span', { class: 'rtag' }, t))),
+  el('span', { class: 'qn' }, it.name, inProject ? null : subLabel(it)),
+  el('span', { class: 'rtags' }, inProject && !state.project ? placeChip(it) : null, (it.tags || []).map(t => el('span', { class: 'rtag' }, t))),
   el('span', { class: 'tc' }, it.category || ''),
   el('span', { class: 'tc num' }, fmtTime(it.duration)),
   el('span', { class: 'tc num' }, (it.recorded || '').slice(0, 10).replace(/:/g, '-')),
@@ -295,19 +285,19 @@ export function row(it, i, width) {
 
 // The subfolders a sound sits in, below whatever level is being shown.
 /** @param {Item} it */
-export function subLabel(it) {
+function subLabel(it) {
   if (!it.sub) return null;
   const shown = state.folder === it.folder && state.under ? state.under.slice(it.folder.length + 1) : '';
   const rest = shown && (it.sub === shown || it.sub.startsWith(shown + '/')) ? it.sub.slice(shown.length + 1) : it.sub;
   return rest ? el('span', { class: 'qsub' }, rest) : null;
 }
 
-export function tableHead() {
+function tableHead() {
   /** @param {string} label @param {string} [key] */
   const col = (label, key) => {
     if (!key) return el('span', { class: 'th' }, label);
     const on = filters().sort === key;
-    const sort = () => { state.sort = on && hasQuery() ? 'score' : key; $('#sort').value = state.sort; search(); };
+    const sort = () => { state.sort = on && hasQuery() ? 'score' : key; search(); };
     const tip = on && hasQuery() ? 'Back to best match first' : `Sort by ${label}`;
     return focusable(el('span', { class: 'th sortable' + (on ? ' on' : ''), role: 'button', 'data-sort': key, onclick: sort, 'data-tip': tip }, label), sort);
   };
@@ -329,7 +319,7 @@ export function select(i, { scroll = true, play = false } = {}) {
   const next = state.items[i], cur = state.cardItem, changed = cur?.path !== next.path;
   if (changed) { state.cardItem = next; renderCard(); }
   else if (cur !== next) { Object.assign(cur, next); state.items[i] = cur; }
-  if (play || (scroll && changed && SETTINGS.autoplay)) host.togglePreview(/** @type {Item} */ (state.cardItem), true);
+  if (play || (scroll && changed && SETTINGS.autoplay)) togglePreview(/** @type {Item} */ (state.cardItem), true);
 }
 
 /** @param {Item} it */

@@ -1,3 +1,4 @@
+// Discover: while a found sound plays, its outline fills up to where playback is. Needs the network.
 const E = await import('/static/engine.js'); await E.setVolume(0.05);
 document.querySelector('.ab[data-view="discover"]').click(); await wait(800);
 const d = window.athar.discover;

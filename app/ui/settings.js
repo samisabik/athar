@@ -1,6 +1,6 @@
 // Settings: kept by the app, applied everywhere, and the page that changes them.
 
-import { $, el, ib, fail, notice, confirmModal } from './ui.js';
+import { $, el, ib, fail, notice, confirmModal, pickFolder } from './ui.js';
 import { lib, app } from './native.js';
 import { setCatSkin } from './cat.js';
 import { CAT_SKINS } from './cats.js';
@@ -8,22 +8,18 @@ import { CAT_SKINS } from './cats.js';
 /** The settings as last loaded; changed in place, so every importer sees the current ones. @type {Record<string, any>} */
 export const SETTINGS = /** @type {Record<string, any>} */ ({});
 
-// What the settings reach on the pages; main.js fills these in.
-/** @type {{ editor: any, redraw: () => void, search: () => void, refreshSide: () => void, loadTags: () => Promise<unknown>, volume: () => number,
-    setVolume: (v: number, save: boolean) => void, pickFolder: (title?: string) => Promise<string | null> }} */
-export const host = {
-  editor: null,
-  redraw: () => { },
-  search: () => { },
-  refreshSide: () => { },
-  loadTags: () => Promise.resolve(),
-  volume: () => 80,
-  setVolume: (v, save) => { },
-  pickFolder: (title) => app.pickFolder(),
-};
-// ---------- settings: stored by the app, applied everywhere
+// Other parts of the window follow the settings they depend on, without this file knowing them.
+/** @type {{ keys: string[], fn: () => void }[]} */
+const watchers = [];
+/** Calls `fn` once the settings have loaded and again whenever one of `keys` changes. @param {string[]} keys @param {() => void} fn */
+export function onSetting(keys, fn) { watchers.push({ keys, fn }); }
+/** Called after a backup has been restored: the tags, ratings and projects on the pages are stale. @type {(() => void) | null} */
+let afterRestore = null;
+/** @param {() => void} fn */
+export function onRestore(fn) { afterRestore = fn; }
+
 /** @type {[string, string][]} */
-export const ACCENTS = [
+const ACCENTS = [
   ['#7a3dff', 'Ultraviolet'], ['#bc13fe', 'Neon purple'], ['#1f51ff', 'Neon blue'], ['#00f0ff', 'Neon cyan'],
   ['#39ff14', 'Neon green'], ['#e7ff00', 'Neon yellow'], ['#ff6a00', 'Neon orange'], ['#ff073a', 'Neon red'],
   ['#ff10f0', 'Neon pink'],
@@ -41,7 +37,7 @@ export const ACCENTS = [
 /** @typedef {SettingRow[2]} SettingKind */
 /** @typedef {SelectOpts | SwatchOpts | NumberOpts | TextOpts} SettingOpts */
 /** @type {[string, SettingRow[]][]} */
-export const SETTINGS_SCHEMA = [
+const SETTINGS_SCHEMA = [
   ['Display', [
     ['theme', 'Appearance', 'select', { options: [['system', 'Match the Mac'], ['light', 'Light'], ['dark', 'Dark']] }],
     ['text_size', 'Text size', 'range', { min: 11, max: 20, step: 1, unit: 'px', onRelease: true }],
@@ -83,7 +79,7 @@ export const SETTINGS_SCHEMA = [
     ['export_rate', 'Sample rate', 'select', { options: [[0, 'Same as original'], [48000, '48 kHz'], [44100, '44.1 kHz'], [32000, '32 kHz'], [24000, '24 kHz'], [22050, '22.05 kHz'], [16000, '16 kHz']] }],
     ['export_bits', 'Bit depth', 'select', { options: [[16, '16-bit'], [24, '24-bit'], [32, '32-bit float']] }],
     ['export_mono', 'Export as mono', 'toggle'],
-    ['name_pattern', 'Project file names', 'text', { hint: '{project} {category} {n:03d} {name}' }],
+    ['name_pattern', 'Project file names', 'text', { hint: 'Use {project}, {category}, {name} and {n:03d} for a three-digit counter' }],
   ]],
   ['SP-404MKII', [
     ['sp404_mono', 'Convert to mono (saves sample memory)', 'toggle'],
@@ -91,11 +87,11 @@ export const SETTINGS_SCHEMA = [
 ];
 // Settings that seed the editor's own fields; written only when they change so per-file choices survive.
 /** @type {Record<string, string>} */
-export const EDITOR_FIELDS = { export_rate: 'rate', export_bits: 'bits', export_format: 'format', prep_target_db: 'norm', silence_db: 'thresh', slice_gap_ms: 'gap', loudness_target: 'lufs' };
+const EDITOR_FIELDS = { export_rate: 'rate', export_bits: 'bits', export_format: 'format', prep_target_db: 'norm', silence_db: 'thresh', slice_gap_ms: 'gap', loudness_target: 'lufs' };
 
 // One accent colour, used at full strength everywhere; soft backgrounds are neutral grey.
 /** @param {string} hex */
-export function applyAccent(hex) {
+function applyAccent(hex) {
   if (!/^#[0-9a-f]{6}$/i.test(hex || '')) hex = ACCENTS[0][0];
   const c = [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
   const r = document.documentElement.style;
@@ -110,29 +106,43 @@ export function applyAccent(hex) {
   r.setProperty('--accent-text', dark ? (light ? hex : mix(.45, 255)) : (light ? mix(.45, 0) : hex));
 }
 // Share Tech Mono draws smaller than its nominal size, so the Text size setting is scaled up to match.
-export const TYPE_SCALE = 1.1;
-export const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
-darkQuery.addEventListener?.('change', () => { if ((SETTINGS.theme || 'system') === 'system') applySettings(); });
+const TYPE_SCALE = 1.1;
+const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+darkQuery.addEventListener?.('change', () => { if ((SETTINGS.theme || 'system') === 'system') applySetting('theme'); });
+
+// What each setting changes on the page itself. The accent's text shade depends on the theme.
+/** @type {Record<string, () => void>} */
+const APPLY = {
+  theme: () => {
+    document.documentElement.dataset.theme = SETTINGS.theme === 'dark' || (SETTINGS.theme !== 'light' && darkQuery.matches) ? 'dark' : 'light';
+    applyAccent(SETTINGS.accent);
+  },
+  text_size: () => document.documentElement.style.setProperty('--fs', SETTINGS.text_size * TYPE_SCALE + 'px'),
+  accent: () => applyAccent(SETTINGS.accent),
+  show_cat: () => { $('#cat').hidden = !SETTINGS.show_cat; },
+  cat_skin: () => setCatSkin(SETTINGS.cat_skin),
+};
+/** @param {string} key */
+function applySetting(key) {
+  APPLY[key]?.();
+  for (const w of watchers) if (w.keys.includes(key)) w.fn();
+}
+/** Applies every setting; called once they have loaded. */
 export function applySettings() {
-  const st = SETTINGS;
-  const theme = st.theme === 'dark' || (st.theme !== 'light' && darkQuery.matches) ? 'dark' : 'light';
-  if (document.documentElement.dataset.theme !== theme) { document.documentElement.dataset.theme = theme; requestAnimationFrame(() => host.redraw()); }
-  if (st._version) document.title = `Athar ${st._version}`;
-  document.documentElement.style.setProperty('--fs', st.text_size * TYPE_SCALE + 'px');
-  host.setVolume(host.volume(), false);
-  host.editor.settings = st;
-  applyAccent(st.accent);
-  $('#cat').hidden = !st.show_cat;
-  setCatSkin(st.cat_skin);
-  host.editor.draw();
+  for (const apply of Object.values(APPLY)) apply();
+  for (const w of watchers) w.fn();
 }
 export function applyEditorFields(keys = Object.keys(EDITOR_FIELDS)) {
   for (const k of keys) {
     const n = $(`#editor [data-f=${EDITOR_FIELDS[k]}]`);
-    if (n && SETTINGS[k] != null) n.value = String(SETTINGS[k]);
+    if (!n || SETTINGS[k] == null) continue;
+    n.value = String(SETTINGS[k]);
+    // Opening another sound puts every tool field back to its default, which is this setting.
+    if (n instanceof HTMLInputElement) n.defaultValue = n.value;
   }
 }
 
+// Changes are applied at once and stored together a moment after they stop.
 /** @type {ReturnType<typeof setTimeout> | undefined} */
 let saveTimer;
 /** @type {Record<string, any>} */
@@ -141,19 +151,17 @@ let pending = {};
 export function saveSetting(key, value) {
   SETTINGS[key] = value;
   pending[key] = value;
-  applySettings();
+  applySetting(key);
   if (key in EDITOR_FIELDS) applyEditorFields([key]);
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     const batch = pending; pending = {};
-    lib.setSettings(batch).then(() => {
-      if (['results_limit', 'default_sort', 'hide_shorter_ms'].some(k => k in batch)) host.search();
-    }).catch(fail);
+    lib.setSettings(batch).catch(fail);
   }, 250);
 }
 
 /** @param {string} key @param {string} label @param {[string, string][]} options */
-export function swatchControl(key, label, options) {
+function swatchControl(key, label, options) {
   const buttons = options.map(([v, l]) => el('button', { type: 'button', class: 'swatch', style: `--sw: ${v}`, 'data-v': v, 'data-tip': l, 'aria-label': l, role: 'radio' }));
   // Any colour at all: the system colour panel behind a rainbow dot, which shows the pick once made.
   const picker = el('input', { type: 'color', 'aria-label': 'Pick any colour' });
@@ -168,7 +176,10 @@ export function swatchControl(key, label, options) {
       b.tabIndex = on || (!any && k === 0) ? 0 : -1;
     });
   };
-  const choose = (/** @type {HTMLButtonElement} */ b) => { clearTimeout(saveTimer); mark(/** @type {string} */ (b.dataset.v)); saveSetting(key, b.dataset.v); };
+  // A colour dragged in the system panel is saved once the dragging rests.
+  /** @type {number | undefined} */
+  let pickTimer;
+  const choose = (/** @type {HTMLButtonElement} */ b) => { clearTimeout(pickTimer); mark(/** @type {string} */ (b.dataset.v)); saveSetting(key, b.dataset.v); };
   buttons.forEach((b, k) => {
     b.onclick = () => choose(b);
     b.onkeydown = (e) => {
@@ -179,18 +190,17 @@ export function swatchControl(key, label, options) {
       n.focus(); choose(n);
     };
   });
-  let saveTimer = 0;
   picker.oninput = () => {
     const v = picker.value.toLowerCase();
     mark(v); applyAccent(v);
-    clearTimeout(saveTimer); saveTimer = setTimeout(() => saveSetting(key, v), 250);
+    clearTimeout(pickTimer); pickTimer = setTimeout(() => saveSetting(key, v), 250);
   };
   mark(String(SETTINGS[key] || '').toLowerCase());
   return el('span', { class: 'swatches', role: 'radiogroup', 'aria-label': label }, buttons, pick);
 }
 
 /** @param {string} key @param {string} id @param {SettingKind} kind @param {SettingOpts} o */
-export function settingControl(key, id, kind, o) {
+function settingControl(key, id, kind, o) {
   if (kind === 'toggle') {
     const c = el('input', { type: 'checkbox', id, class: 'switch' });
     c.checked = !!SETTINGS[key];
@@ -242,7 +252,7 @@ export function renderSettings() {
       const name = el('span', { class: 'slabel' }, label, hint ? el('small', {}, hint) : null);
       sec.append(kind === 'folder'
         ? el('div', { class: 'srow' }, name, el('span', { class: 'sfolder' }, el('span', { class: 'mono', 'data-tip': SETTINGS[key] }, SETTINGS[key]),
-          el('button', { class: 'ghost', onclick: async () => { const d = await host.pickFolder(); if (d) { saveSetting(key, d); renderSettings(); } } }, 'Change')))
+          el('button', { class: 'ghost', onclick: async () => { const d = await pickFolder(label); if (d) { saveSetting(key, d); renderSettings(); } } }, 'Change')))
         : kind === 'swatch'
         ? el('div', { class: 'srow' }, name, swatchControl(key, label, /** @type {SwatchOpts} */ (o).options))
         : el('label', { class: 'srow', for: id }, name, settingControl(key, id, kind, o)));
@@ -253,14 +263,14 @@ export function renderSettings() {
     el('div', { class: 'srow' }, el('span', { class: 'slabel' }, 'Your tags, ratings, notes, regions and projects', el('small', {}, 'One file you can keep somewhere safe, or carry to another Mac')),
       el('span', { class: 'sfolder' },
         el('button', { class: 'ghost', onclick: async () => {
-          const dir = await host.pickFolder('Save the backup into'); if (!dir) return;
+          const dir = await pickFolder('Save the backup into'); if (!dir) return;
           try { notice(`Backup saved: ${(await lib.backup({ path: dir })).path}`, 8000); } catch (e) { fail(e); }
         } }, 'Back up'),
         el('button', { class: 'ghost', onclick: async () => {
           const file = await app.pickFile();
           if (!file) return;
           if (!await confirmModal('Restore this backup?', 'Tags, ratings and notes in the file replace the current ones for the sounds it names. Projects in the file are added.', 'Restore')) return;
-          try { const r = await lib.restore({ path: file }); notice(`Restored ${r.sounds} sounds and ${r.projects} projects`); host.refreshSide(); host.search(); host.loadTags().catch(() => { }); } catch (e) { fail(e); }
+          try { const r = await lib.restore({ path: file }); notice(`Restored ${r.sounds} sounds and ${r.projects} projects`); afterRestore?.(); } catch (e) { fail(e); }
         } }, 'Restore')))));
   box.append(el('div', { class: 'sgroup' }, el('h2', {}, 'About'),
     el('div', { class: 'srow' }, el('span', { class: 'slabel' }, 'Version'), el('span', { class: 'mono' }, SETTINGS._version || '')),

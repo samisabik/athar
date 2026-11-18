@@ -1,22 +1,28 @@
-import { lib } from './native.js';
+// The editor page: the waveform or spectrogram of one sound, its selection, regions and playback,
+// and every action of its toolbar. The sound itself is held and changed natively (app/src/doc.rs);
+// effects and tools that take values open in the panel below (fx.js).
+
+import { lib, doc } from './native.js';
 import { fmtTime } from './time.js';
-import { invoke, now, onEnded, forget } from './engine.js';
-import { TOOLS } from './tools.js';
+import { now, onEnded, forget } from './engine.js';
+import { TOOLS, toolEdit, toolRefusal, fadeSpans } from './tools.js';
+import { noteAt, hzLabel } from './units.js';
+import { fitCanvas, palette, monoFont } from './canvas.js';
 
 const REGION_COLORS = ['--c1', '--c2', '--c3', '--c4', '--c5'];
 
-const UNDO_BYTES = 1.5 * 2 ** 30;
+// The height of the time ruler along the top of the waveform.
+const RULER = 18;
 const SPEC_BG = '#12101e';
 const SPEC_TILE = 256, SPEC_TILES_KEPT = 160;
-const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
-/** @param {number} f */
-function noteOf(f) { const m = Math.round(69 + 12 * Math.log2(f / 440)); return NOTE_NAMES[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1); }
 
+// A tool is auditioned over at most this many seconds, with a short fade at each end.
 const AUDITION_S = 8, AUDITION_FADE_S = 0.02, AUDITION_FADE_IN_S = 0.002;
 
 /** @typedef {[number, number]} Span */
 /** @typedef {{ a: number, b: number, name: string }} Region */
-/** @typedef {{ a: number, b: number, fadeIn: boolean }} FadeSpan */
+/** @typedef {import('./tools.js').FadeSpan} FadeSpan */
+/** @typedef {Error} Failure What a native command rejects with. */
 /**
  * @typedef {{ length: number, channels: number, sr: number, version: number, dirty: boolean, path?: string | null,
  *   undo: number, redo: number, regions: Region[], sel: Span | null, cursor: number }} EdState
@@ -30,13 +36,15 @@ const AUDITION_S = 8, AUDITION_FADE_S = 0.02, AUDITION_FADE_IN_S = 0.002;
 /** @typedef {{ dir: string, where: string, project?: number }} SaveTarget */
 /** @typedef {(msg: string, ms?: number) => void} Notify */
 /**
+ * What the editor asks of the app around it. `toast` is for passing confirmations and `notice`
+ * for what the user must read; `place` names the project (or 'Library') the open file is in.
  * @typedef {{
  *   onSave: (p: RenderOpts, dir: string, name: string, opts?: SaveOpts) => Promise<string | null>,
- *   toast: Notify, notice?: Notify,
+ *   toast: Notify, notice: Notify,
  *   pickFolder: (title?: string, start?: string) => Promise<string | null>,
- *   ask?: (title: string, value: string) => Promise<string | undefined>,
- *   whereToSave?: (title?: string) => Promise<SaveTarget | null>,
- *   place?: () => string,
+ *   ask: (title: string, value: string) => Promise<string | undefined>,
+ *   whereToSave: (title?: string) => Promise<SaveTarget | null>,
+ *   place: () => string,
  * }} EditorHooks
  */
 
@@ -46,24 +54,23 @@ export class Editor {
     this.root = root;
     this.onSave = onSave; this.whereToSave = whereToSave; this.place = place;
     this.ask = ask;
-    /** The effects panel, set once it is made. @type {import('./fx.js').FxPanel} */
+    /** The effects panel. It needs the editor to exist, so editing.js sets it right after this constructor. @type {import('./fx.js').FxPanel} */
     this.fx = /** @type {import('./fx.js').FxPanel} */ (/** @type {unknown} */ (null));
     /** The app's settings, as last loaded. @type {Record<string, any> | null} */
     this.settings = null;
-    /** Told when an audition starts, and when the sound becomes edited or saved. @type {(() => void) | null} */
+    /** Told when an audition is about to start, so that other players stop. @type {(() => void) | null} */
     this.onAudition = null;
     /** @type {((dirty: boolean) => void) | null} */
     this.onDirtyChange = null;
     /** The painted background and waveform, copied in on every frame. @type {HTMLCanvasElement | null} */
     this.layer = null;
-    this.toast = toast; this.notice = notice || toast;
+    this.toast = toast; this.notice = notice;
     this.pickFolder = pickFolder;
     this.canvas = /** @type {HTMLCanvasElement} */ (root.querySelector('canvas'));
     this.g = /** @type {CanvasRenderingContext2D} */ (this.canvas.getContext('2d'));
     this.mode = 'wave';
     this.version = 0;
     this.undoN = 0; this.redoN = 0;
-    this.clip = null;
     this.loop = false;
     /** @type {boolean | undefined} */ this.loaded;
     /** @type {string} */ this.name;
@@ -93,17 +100,17 @@ export class Editor {
     /** @type {number | undefined} */ this.meterVersion;
     /** @type {ReturnType<typeof setTimeout> | null | undefined} */ this.meterTimer;
     /** @type {boolean | undefined} */ this.wasDirty;
-    /** @type {boolean | undefined} */ this.savedOnce;
     /** @type {boolean | undefined} */ this.playing;
     /** @type {object | null | undefined} */ this.playToken;
     /** @type {number | null | undefined} */ this.voice;
+    /** Whether what plays went out through the live EQ. @type {boolean} */ this.playEq = false;
     /** @type {boolean} */ this.playLoop;
     /** @type {number} */ this.playA;
     /** @type {number} */ this.playStart;
     /** @type {number} */ this.playB;
     /** @type {number} */ this.playT;
     /** @type {boolean | undefined} */ this.changing;
-    /** @type {boolean | undefined} */ this.hasClip;
+    /** Something was copied or cut; the native side holds it. @type {boolean | undefined} */ this.hasClip;
     /** @type {{ key: string, r: Span | null } | undefined} */ this.trimKept;
     /** @type {number | undefined} */ this.auditionId;
     /** @type {object | null | undefined} */ this.auditionToken;
@@ -116,21 +123,27 @@ export class Editor {
 
   /** @param {string} sel @returns {any} */
   $(sel) { return this.root.querySelector(sel); }
+  /** The control holding the value named by data-f: a save option, or a tool's field (see tools.js). @param {string} name @returns {HTMLInputElement | HTMLSelectElement} */
+  field(name) { return this.$(`[data-f=${name}]`); }
+  /** @param {string} name */
+  num(name) { return Number(this.field(name).value); }
+  /** @param {string} name @param {number} v */
+  setNum(name, v) { this.field(name).value = String(v); }
 
   // The sound, its history and its regions are held by the native side; the page knows their
   // shape and draws them. `source` is { path } for a library file or { key } for a recorded take.
-  /** @param {{ source: { path: string } | { key: string }, name: string, dir?: string | null, path?: string | null, tempo?: number | string | null }} o */
-  async load({ source, name, dir, path = null, tempo = null }) {
+  /** @param {{ source: { path: string } | { key: string }, name: string, dir?: string | null, tempo?: number | string | null }} o */
+  async load({ source, name, dir, tempo = null }) {
     this.stopPlay(); this.stopAudition(); this.shownLen = 0;
-    const info = await invoke('ed_open', source);
+    const info = await doc.open(source);
     this.loaded = true; this.name = name; this.dir = dir;
     this.adopt(info);
     this.fileId = (this.fileId || 0) + 1;
-    this.$('[data-f=bpm]').value = tempo || 120;
+    this.field('bpm').value = String(tempo || 120);
     this.hover = null;
     this.root.classList.remove('blank');
-    this.fx?.fileChanged();
-    this.$('[data-f=name]').value = name.replace(/\.[^.]+$/, '') + (this.settings?.edit_suffix ?? '_edit');
+    this.fx.fileChanged();
+    this.field('name').value = name.replace(/\.[^.]+$/, '') + (this.settings?.edit_suffix ?? '_edit');
     this.$('[data-f=title]').textContent = name;
     this.fit();
   }
@@ -173,7 +186,16 @@ export class Editor {
     this.spp = Math.max(1 / 16, (b - a) / this.width()); this.start = a; this.clampView(); this.draw();
   }
   // ---- bars and beats
-  beatLen() { const bpm = Number(this.$('[data-f=bpm]').value); return this.bars && bpm > 0 ? this.sr * 60 / bpm : 0; }
+  // The length of a beat in samples, or 0 while the grid is off.
+  beatLen() { const bpm = this.num('bpm'); return this.bars && bpm > 0 ? this.sr * 60 / bpm : 0; }
+  // How many beats apart the grid's lines or labels go to stay at least minPx apart: every
+  // beat, every second one, every bar, then every 4, 8, 16 bars.
+  /** @param {number} beat @param {number} minPx */
+  beatStride(beat, minPx) {
+    let every = 1;
+    while (beat * every / this.spp < minPx) every *= every === 4 ? 4 : 2;
+    return every;
+  }
   // With the grid on, a position within a few pixels of a quarter beat lands on it.
   /** @param {number} s */
   snap(s) {
@@ -183,22 +205,20 @@ export class Editor {
   }
   clampView() { this.start = Math.max(0, Math.min(this.start, this.viewLen() - this.width() * this.spp)); }
 
+  // What an edit or a tool works on: the selection, or the whole sound without one.
+  /** @returns {Span} */
   range() {
     if (this.sel && this.sel[1] - this.sel[0] > 0) return this.sel;
     return [0, this.length];
   }
+  // Names the sound and the range: it changes with every edit, undo and move of the selection.
+  rangeKey() { return `${this.version}|${this.range().join('|')}`; }
 
   // ---- drawing
   draw() {
     if (!this.loaded) return this.drawEmpty();
-    const dpr = window.devicePixelRatio || 1;
-    const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
-    if (!W || !H) return;
-    if (this.canvas.width !== W * dpr || this.canvas.height !== H * dpr) {
-      this.canvas.width = W * dpr; this.canvas.height = H * dpr;
-    }
-    const g = this.g;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const fit = fitCanvas(this.canvas); if (!fit) return;
+    const { g, W, H, dpr } = fit;
     // A view that showed the whole sound keeps showing the whole of whatever replaces it.
     const shown = this.viewSrc().length;
     if (shown !== this.shownLen) {
@@ -206,15 +226,13 @@ export class Editor {
       this.shownLen = shown;
       if (whole) { this.start = 0; this.spp = Math.max(1 / 16, shown / W); } else this.clampView();
     }
-    const css = getComputedStyle(document.documentElement);
-    const col = (/** @type {string} */ n) => css.getPropertyValue(n).trim();
-    const RULER = 18;
+    const col = palette();
     const secPerPx = this.spp / this.sr;
     const steps = [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60];
     const tick = steps.find(s => s / secPerPx > 80) || 60;
     const t0 = Math.ceil(this.start / this.sr / tick) * tick;
     if (this.mode === 'spec') { g.fillStyle = col('--wave-bg'); g.fillRect(0, 0, W, H); this.drawSpec(RULER, W, H - RULER); }
-    else this.drawWave(col, RULER, W, H, dpr, tick);
+    else this.drawWave(col, W, H, dpr, tick);
 
     this.regions.forEach((r, i) => {
       const x0 = this.sampleToX(r.a), x1 = this.sampleToX(r.b);
@@ -222,7 +240,7 @@ export class Editor {
       g.fillStyle = col(REGION_COLORS[i % REGION_COLORS.length]);
       g.globalAlpha = 0.18; g.fillRect(x0, RULER, x1 - x0, H - RULER);
       g.globalAlpha = 1; g.fillRect(x0, RULER, Math.max(2, x1 - x0), 14);
-      g.fillStyle = col('--ink'); g.font = '11px "Share Tech Mono", "Martian Mono", ui-monospace, monospace';
+      g.fillStyle = col('--ink'); g.font = monoFont(11);
       g.fillText(r.name || String(i + 1).padStart(2, '0'), x0 + 4, RULER + 11);
     });
 
@@ -233,7 +251,7 @@ export class Editor {
     // The open Fade tool draws the level the sound will have, as one shape: up from silence,
     // flat at full level, down to silence. The area under it is tinted, and a square marks the
     // end of each fade, which is where it can be dragged.
-    const fades = this.fx?.toolMark();
+    const fades = this.fx.toolMark();
     if (fades) {
       const [fin, fout] = fades, top = RULER + 8, bottom = H - 2, xa = this.sampleToX(fin.a), xb = this.sampleToX(fout.b);
       const level = (/** @type {number} */ s) => (fin.b > fin.a && s < fin.b ? Math.sin((s - fin.a) / (fin.b - fin.a) * Math.PI / 2) ** 2 : 1)
@@ -251,7 +269,7 @@ export class Editor {
       for (const x of [this.sampleToX(fin.b), this.sampleToX(fout.a)]) if (x >= -6 && x <= W + 6) g.fillRect(Math.round(x) - 5, Math.round(yOf(x)) - 5, 10, 10);
     }
     // Open on Trim silent ends, the parts it would cut are covered, with a line at each new edge.
-    if (this.fx?.tab === 'tool' && this.fx.toolName === 'trimsilence') {
+    if (this.fx.tab === 'tool' && this.fx.toolName === 'trimsilence') {
       const r = this.trimBounds() || [0, 0];
       g.fillStyle = col('--wave-bg'); g.globalAlpha = 0.78;
       const xa = Math.min(W, this.sampleToX(r[0])), xb = Math.max(0, this.sampleToX(r[1]));
@@ -267,11 +285,11 @@ export class Editor {
     g.fillStyle = col('--accent'); g.fillRect(Math.round(head) - 1, RULER, 2, H - RULER);
 
     g.fillStyle = col('--panel'); g.fillRect(0, 0, W, RULER);
-    g.fillStyle = col('--muted'); g.font = '11px "Share Tech Mono", "Martian Mono", ui-monospace, monospace';
+    g.fillStyle = col('--muted'); g.font = monoFont(11);
     const beatNow = this.beatLen();
     if (beatNow) {
       // Bar numbers, with beats as "3.2" once there is room for them.
-      let every = 1; while (beatNow * every / this.spp < 46) every *= every < 4 ? 2 : every === 4 ? 4 : 2;
+      const every = this.beatStride(beatNow, 46);
       for (let k = Math.ceil(this.start / beatNow / every) * every; this.sampleToX(k * beatNow) < W; k += every) {
         const x = this.sampleToX(k * beatNow);
         if (x >= 1) g.fillRect(x, RULER - 5, 1, 5);
@@ -292,8 +310,8 @@ export class Editor {
   // are painted once into a layer; a playback frame then costs one image copy plus the playhead.
   // The waveform's points come from the native side for exactly the pixels shown; until they
   // arrive the last layer stays on screen.
-  /** @param {(n: string) => string} col @param {number} RULER @param {number} W @param {number} H @param {number} dpr @param {number} tick */
-  drawWave(col, RULER, W, H, dpr, tick) {
+  /** @param {(n: string) => string} col @param {number} W @param {number} H @param {number} dpr @param {number} tick */
+  drawWave(col, W, H, dpr, tick) {
     const view = this.viewSrc();
     const paint = [col('--wave-bg'), col('--line'), col('--wave'), col('--muted')];
     // Behind the result of an open effect or tool, the sound as it is now stays visible, fainter.
@@ -303,10 +321,10 @@ export class Editor {
     if (this.layerKey !== key && this.peaksKey !== key) {
       this.peaksKey = key;
       const want = ghost ? ['doc', view.src] : [view.src];
-      Promise.all(want.map(src => invoke('ed_peaks', { src, start: this.start, spp: this.spp, width: Math.ceil(W) })))
+      Promise.all(want.map(src => doc.peaks(src, this.start, this.spp, Math.ceil(W))))
         .then((bufs) => {
           if (this.peaksKey !== key) return;
-          this.paintLayer(key, bufs.map(b => new Float32Array(b)), ghost, paint, RULER, W, H, dpr, tick, beat);
+          this.paintLayer(key, bufs.map(b => new Float32Array(b)), ghost, paint, W, H, dpr, tick, beat);
           this.draw();
         })
         .catch(() => { if (this.peaksKey === key) this.peaksKey = null; });
@@ -319,9 +337,9 @@ export class Editor {
 
   /**
    * @param {string} key @param {Float32Array[]} sets @param {boolean} ghost @param {string[]} paint
-   * @param {number} RULER @param {number} W @param {number} H @param {number} dpr @param {number} tick @param {number} beat
+   * @param {number} W @param {number} H @param {number} dpr @param {number} tick @param {number} beat
    */
-  paintLayer(key, sets, ghost, paint, RULER, W, H, dpr, tick, beat) {
+  paintLayer(key, sets, ghost, paint, W, H, dpr, tick, beat) {
     const layer = this.layer ||= document.createElement('canvas');
     layer.width = this.canvas.width; layer.height = this.canvas.height;
     const g = /** @type {CanvasRenderingContext2D} */ (layer.getContext('2d'));
@@ -332,7 +350,7 @@ export class Editor {
     const half = tick / 2;
     if (beat) {
       // A line per beat, heavier on each bar; beats thin out when they would crowd.
-      let every = 1; while (beat * every / this.spp < 14) every *= every < 4 ? 2 : every === 4 ? 4 : 2;
+      const every = this.beatStride(beat, 14);
       for (let k = Math.ceil(this.start / beat / every) * every; this.sampleToX(k * beat) < W; k += every) {
         g.globalAlpha = k % 4 === 0 ? 0.95 : 0.4;
         g.fillRect(Math.round(this.sampleToX(k * beat)), RULER, 1, H - RULER);
@@ -381,17 +399,9 @@ export class Editor {
   }
 
   drawEmpty() {
-    const dpr = window.devicePixelRatio || 1;
-    const W = this.canvas.clientWidth, H = this.canvas.clientHeight;
-    if (!W || !H) return;
-    if (this.canvas.width !== W * dpr || this.canvas.height !== H * dpr) {
-      this.canvas.width = W * dpr; this.canvas.height = H * dpr;
-    }
-    const g = this.g;
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const css = getComputedStyle(document.documentElement);
-    const col = (/** @type {string} */ n) => css.getPropertyValue(n).trim();
-    const RULER = 18, secs = 10, pps = W / secs;
+    const fit = fitCanvas(this.canvas); if (!fit) return;
+    const { g, W, H } = fit, col = palette();
+    const secs = 10, pps = W / secs;
     g.fillStyle = col('--wave-bg'); g.fillRect(0, 0, W, H);
     g.fillStyle = col('--line');
     for (let t = 0.5; t < secs; t += 0.5) {
@@ -402,10 +412,10 @@ export class Editor {
     const laneH = (H - RULER) / 2;
     for (let c = 0; c < 2; c++) g.fillRect(0, Math.round(RULER + c * laneH + laneH / 2), W, 1);
     g.fillStyle = col('--panel'); g.fillRect(0, 0, W, RULER);
-    g.fillStyle = col('--muted'); g.font = '11px "Share Tech Mono", "Martian Mono", ui-monospace, monospace';
+    g.fillStyle = col('--muted'); g.font = monoFont(11);
     for (let t = 0; t < secs; t++) { const x = t * pps; if (t) g.fillRect(x, RULER - 5, 1, 5); g.fillText(t + 's', x + 3, 11); }
     const msg = 'Double-click a sound, or use its Edit button';
-    g.font = '12px "Share Tech Mono", "Martian Mono", ui-monospace, monospace';
+    g.font = monoFont(12);
     const tw = g.measureText(msg).width, bx = (W - tw) / 2 - 12, by = RULER + (H - RULER) / 2 - 16;
     g.fillStyle = col('--wave-bg'); g.fillRect(bx, by, tw + 24, 32);
     g.fillStyle = col('--muted'); g.fillText(msg, bx + 12, by + 20);
@@ -441,17 +451,17 @@ export class Editor {
     // Frequency axis, plus a readout of frequency and note under the pointer.
     const g = this.g, fmin = 20, fmax = this.sr / 2;
     const yOf = (/** @type {number} */ f) => top + H * (1 - Math.log(f / fmin) / Math.log(fmax / fmin));
-    g.font = '10px "Share Tech Mono", "Martian Mono", ui-monospace, monospace';
+    g.font = monoFont(10);
     for (const f of [50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]) {
       if (f >= fmax) break;
       const y = Math.round(yOf(f)) + .5;
       g.fillStyle = 'rgba(255,246,214,.18)'; g.fillRect(0, y, W, 1);
-      g.fillStyle = 'rgba(255,246,214,.75)'; g.fillText(f >= 1000 ? f / 1000 + 'k' : String(f), 4, y - 3);
+      g.fillStyle = 'rgba(255,246,214,.75)'; g.fillText(hzLabel(f), 4, y - 3);
     }
     if (this.hover && this.hover.y > top) {
       const f = fmin * Math.pow(fmax / fmin, 1 - (this.hover.y - top) / H);
       const t = this.xToSample(this.hover.x) / this.sr;
-      const txt = `${f >= 1000 ? (f / 1000).toFixed(2) + ' kHz' : Math.round(f) + ' Hz'}  ${noteOf(f)}  ${t.toFixed(2)}s`;
+      const txt = `${f >= 1000 ? (f / 1000).toFixed(2) + ' kHz' : Math.round(f) + ' Hz'}  ${noteAt(f).name}  ${t.toFixed(2)}s`;
       const w = g.measureText(txt).width + 14, bx = Math.min(W - w - 4, this.hover.x + 12), by = Math.max(top + 4, this.hover.y - 26);
       g.fillStyle = 'rgba(18,16,30,.85)'; g.fillRect(bx, by, w, 20);
       g.fillStyle = '#fff6d6'; g.fillText(txt, bx + 7, by + 14);
@@ -466,7 +476,7 @@ export class Editor {
       for (let w; (w = this.specWant) && w.missing.length;) {
         const k = /** @type {number} */ (w.missing.shift()), key = `${w.zoom}|${k}`, tiles = /** @type {{ dataKey: string, map: Map<string, SpecTile> }} */ (this.tiles);
         if (tiles.dataKey !== w.dataKey || tiles.map.has(key)) continue;
-        const pixels = new Uint8ClampedArray(await invoke('ed_spec', { src: w.src, start: k * SPEC_TILE * w.spd, spp: w.spd, pw: SPEC_TILE, rows: w.rows }));
+        const pixels = new Uint8ClampedArray(await doc.spec(w.src, k * SPEC_TILE * w.spd, w.spd, SPEC_TILE, w.rows));
         const canvas = document.createElement('canvas');
         canvas.width = SPEC_TILE; canvas.height = w.rows;
         /** @type {CanvasRenderingContext2D} */ (canvas.getContext('2d')).putImageData(new ImageData(pixels, SPEC_TILE, w.rows), 0, 0);
@@ -475,23 +485,26 @@ export class Editor {
         while (tiles.map.size > SPEC_TILES_KEPT) tiles.map.delete(/** @type {string} */ (tiles.map.keys().next().value));
         this.draw();
       }
-    } catch (e) { this.specFailed = this.specWant?.dataKey; this.specWant = null; this.notice(`Spectrogram failed: ${/** @type {Error} */ (e).message || e}`); }
+    } catch (e) { this.specFailed = this.specWant?.dataKey; this.specWant = null; this.notice(`Spectrogram failed: ${/** @type {Failure} */ (e).message}`); }
     finally { this.specBusy = false; }
   }
 
   // What the waveform shows: the sound, or the result of the open effect or tool ({ src, length }).
-  viewSrc() { return this.fx?.displayView() || { src: 'doc', length: this.length }; }
+  viewSrc() { return this.fx.displayView() || { src: 'doc', length: this.length }; }
 
+  /** Builds the line of chips again, whatever it last showed. */
+  refreshInfo() { this.infoSig = null; this.updateInfo(); }
   updateInfo() {
     const sec = (/** @type {number} */ s) => fmtTime(s / this.sr, true);
     const nch = this.nch;
-    const outRate = Number(this.$('[data-f=rate]')?.value) || this.sr;
-    const bits = this.$('[data-f=bits]')?.value;
-    const sig = [this.length, this.sr, nch, outRate, bits, this.version, this.savedOnce,
+    const outRate = this.num('rate') || this.sr;
+    const bits = this.field('bits').value;
+    // Everything the line of chips shows; nothing is rebuilt while it stays the same.
+    const sig = [this.length, this.sr, nch, outRate, bits, this.version,
       this.sel?.join(), this.cursor, this.undoN, this.redoN, this.isDirty, this.meterVersion].join('|');
     if (sig === this.infoSig) return;
     this.infoSig = sig;
-    this.fx?.selectionChanged();
+    this.fx.selectionChanged();
     this.$('[data-a=mono]').hidden = nch === 1;
     const khz = (/** @type {number} */ r) => `${+(r / 1000).toFixed(2)} kHz`;
     const chips = [
@@ -511,9 +524,9 @@ export class Editor {
         this.meterTimer = null;
         if (!this.loaded) return;
         const v = this.version;
-        try { const m = await invoke('ed_analyse', { p: { kind: 'measure' } }); if (v === this.version) { this.meter = m; this.meterVersion = v; } }
+        try { const m = await doc.analyse({ kind: 'measure' }); if (v === this.version) { this.meter = m; this.meterVersion = v; } }
         catch { return; }
-        this.infoSig = null; this.updateInfo();
+        this.refreshInfo();
       }, 300);
     }
     const info = this.$('[data-f=info]');
@@ -526,7 +539,7 @@ export class Editor {
     if (changed !== this.wasDirty) { this.wasDirty = changed; this.onDirtyChange?.(changed); }
     this.$('#saveBtn').classList.toggle('strong', changed);
     // The name reads like a path: the project (or Library) the file is in, then the file.
-    const place = this.$('[data-f=place]'), where = this.path ? this.place?.() || '' : '';
+    const place = this.$('[data-f=place]'), where = this.path ? this.place() : '';
     place.textContent = where; place.hidden = !where;
     place.dataset.tip = where === 'Library' ? 'This file is in a Library folder' : `This file is in the project ${where}`;
     // Last among the chips, and hard to miss: what is on screen is not on disk.
@@ -552,17 +565,19 @@ export class Editor {
     const [a, b] = hasSel ? /** @type {Span} */ (this.sel) : [this.loop || fromStart ? 0 : this.cursor, this.length];
     if (b - a < 1) return;
     const start = pos != null && pos >= a && pos < b ? Math.floor(pos) : (!hasSel && this.loop && !fromStart && this.cursor < b ? this.cursor : a);
-    const pv = this.fx?.playSrc();
+    const pv = this.fx.playSrc();
     let src = 'doc', base = 0, end = b;
     if (pv && start >= pv.a && start < pv.b) { src = pv.src; base = pv.a; end = Math.min(b, pv.b); }
     const loop = this.loop, token = this.playToken = {};
     this.playLoop = loop; this.playA = a; this.playStart = start; this.playB = end; this.playT = now() + 0.03; this.playing = true;
     this.syncPlayBtn();
-    const eq = this.playEq = this.fx?.liveEq() || false;
+    // The live EQ plays the bands the native side holds, so it gets the current ones first.
+    const eq = this.playEq = this.fx.eqLive;
+    if (eq) this.fx.syncEq();
     let r;
-    try { r = await invoke('ed_play', { p: { src, a: Math.max(0, a - base), b: end - base, start: start - base, loop, eq } }); }
-    catch (e) { if (this.playToken === token) { this.playing = false; this.syncPlayBtn(); this.draw(); } return; }
-    if (this.playToken !== token) return void invoke('ed_stop', { id: r.id }).catch(() => { });
+    try { r = await doc.play({ src, a: Math.max(0, a - base), b: end - base, start: start - base, loop, eq }); }
+    catch { if (this.playToken === token) { this.playing = false; this.syncPlayBtn(); this.draw(); } return; }
+    if (this.playToken !== token) return void doc.stop(r.id);
     this.voice = r.id; this.playT = r.at;
     onEnded(r.id, () => { if (this.voice === r.id) { this.voice = null; this.playing = false; this.draw(); this.syncPlayBtn(); } });
     const tick = () => { if (!this.playing || this.playToken !== token) return; this.draw(); requestAnimationFrame(tick); };
@@ -577,12 +592,12 @@ export class Editor {
   // send: false when another sound is about to take over, which stops this one by itself.
   stopPlay(send = true) {
     this.playToken = null;
-    if (this.voice != null) { forget(this.voice); if (send) invoke('ed_stop', { id: this.voice }).catch(() => { }); this.voice = null; }
+    if (this.voice != null) { forget(this.voice); if (send) doc.stop(this.voice); this.voice = null; }
     this.playing = false; this.syncPlayBtn();
   }
   toggle() {
     if (this.auditioning) { this.stopAudition(); return; }
-    if (!this.playing && this.fx?.showsOtherLength()) return void this.audition(this.fx.toolName);
+    if (!this.playing && this.fx.showsOtherLength()) return void this.audition(this.fx.toolName);
     this.playing ? this.stopPlay() : this.play(); this.draw();
   }
   syncPlayBtn() { const b = this.$('[data-a=play] .i'); if (b) b.textContent = this.playing ? 'stop' : 'play_arrow'; }
@@ -591,39 +606,45 @@ export class Editor {
   // Every change is made natively, history included; the page sends its selection and cursor
   // along and shows what comes back.
   refit() { if (this.spp * this.width() > this.viewLen()) this.fit(); else { this.clampView(); this.draw(); } }
-  /** @param {string} cmd @param {Record<string, unknown>} args */
-  async change(cmd, args) {
+  // One change at a time: `send` makes it natively, given the selection and cursor, and resolves
+  // with the new state. Resolves null when nothing changed, the reason shown as a notice.
+  /** @param {(ui: import('./native.js').DocUi) => Promise<EdState & Record<string, any>>} send */
+  async change(send) {
     if (!this.loaded || this.changing) return null;
     this.changing = true;
     try {
-      const res = await invoke(cmd, { ...args, ui: this.ui() });
+      const res = await send(this.ui());
       this.adopt(res);
       this.refit();
       return res;
-    } catch (e) { this.notice(String(/** @type {Error} */ (e)?.message || e)); return null; }
+    } catch (e) { this.notice(/** @type {Failure} */ (e).message); return null; }
     finally { this.changing = false; }
   }
+  // An edit of the sound. Its joins are smoothed over a few milliseconds unless the settings say not to.
   /** @param {Record<string, unknown>} p */
   edit(p) {
     this.stopPlay();
-    return this.change('ed_edit', { p: { smooth_ms: this.settings?.smooth_edits === false ? 0 : (this.settings?.edit_fade_ms ?? 3), ...p } });
+    const smooth_ms = this.settings?.smooth_edits === false ? 0 : (this.settings?.edit_fade_ms ?? 3);
+    return this.change((ui) => doc.edit({ smooth_ms, ...p }, ui));
   }
   /** @param {Record<string, unknown>} p */
   async editRegions(p) {
     const hadSel = !!this.sel;
-    const r = await this.change('ed_regions', { p });
+    const r = await this.change((ui) => doc.regions(p, ui));
     if (r && hadSel && !this.sel && this.playing) this.play(true);
     return r;
   }
-  doUndo() { this.stopPlay(); return this.change('ed_undo', { redo: false }); }
-  doRedo() { this.stopPlay(); return this.change('ed_undo', { redo: true }); }
+  doUndo() { this.stopPlay(); return this.change((ui) => doc.undo(false, ui)); }
+  doRedo() { this.stopPlay(); return this.change((ui) => doc.undo(true, ui)); }
 
-  /** @param {string} name */
+  // Everything a button, a menu item or a key can ask for, by name. For a tool this is its
+  // Apply: it resolves with something truthy once the tool has run, and with nothing when it
+  // refused or failed.
+  /** @param {string} name @returns {Promise<unknown>} */
   async action(name) {
     const sel = this.sel && this.sel[1] > this.sel[0];
     const needSel = () => { if (!sel) { this.notice('Select a region first'); return false; } return true; };
     const whole = () => sel && /** @type {Span} */ (this.sel)[0] === 0 && /** @type {Span} */ (this.sel)[1] === this.length;
-    const val = (/** @type {string} */ f) => Number(this.$(`[data-f=${f}]`).value);
     const [a, b] = this.range();
     switch (name) {
       case 'play': return this.toggle();
@@ -640,9 +661,9 @@ export class Editor {
       case 'bars': {
         if (this.bars) this.bars = false;
         else {
-          const v = Number(await this.ask?.('Tempo in beats per minute', this.$('[data-f=bpm]').value));
+          const v = Number(await this.ask('Tempo in beats per minute', this.field('bpm').value));
           if (!(v >= 20 && v <= 400)) return;
-          this.$('[data-f=bpm]').value = v; this.bars = true;
+          this.setNum('bpm', v); this.bars = true;
         }
         this.$('[data-a=bars]').classList.toggle('on', this.bars); this.layerKey = null;
         return this.draw();
@@ -656,7 +677,8 @@ export class Editor {
         if (whole()) return this.notice('Cannot delete the whole sound');
         return this.edit({ kind: 'delete', a, b });
       case 'copy': if (!needSel()) return;
-        await invoke('ed_edit', { p: { kind: 'copy', a, b } }); this.hasClip = true; return this.toast('Copied');
+        try { await doc.edit({ kind: 'copy', a, b }); } catch (e) { return this.notice(/** @type {Failure} */ (e).message); }
+        this.hasClip = true; return this.toast('Copied');
       case 'cut': if (!needSel()) return;
         if (whole()) return this.notice('Cannot cut the whole sound');
         if (await this.edit({ kind: 'cut', a, b })) this.hasClip = true;
@@ -667,53 +689,13 @@ export class Editor {
         return this.edit({ kind: 'paste', a: x, b: y });
       }
       case 'silence': if (!needSel()) return; return this.edit({ kind: 'silence', a, b });
-      case 'fade': {
-        const spans = this.fadeSpans().filter(m => m.b > m.a);
-        if (!spans.length) return this.notice('Set a fade in or a fade out length first');
-        return this.edit({ kind: 'fade', spans });
-      }
-      case 'normalize': return this.edit({ kind: 'normalize', a, b, db: val('norm') || -1 });
-      case 'gain': return this.edit({ kind: 'gain', a, b, db: val('gain') || 0 });
+      case 'fade': case 'normalize': case 'gain': case 'speed': case 'tune': case 'loudnorm': case 'stretch': case 'loopxfade': case 'declick':
+        return this.applyTool(name);
       case 'reverse': return this.edit({ kind: 'reverse', a, b });
       case 'mono': if (this.nch < 2) return; return this.edit({ kind: 'mono' });
-      case 'speed': {
-        const pct = val('speed') || 100;
-        if (pct <= 0 || pct === 100) return;
-        return this.respeed(pct / 100);
-      }
-      case 'tune': {
-        const semis = val('tunesemis') || 0;
-        if (!semis) return;
-        return this.respeed(Math.pow(2, semis / 12));
-      }
-      case 'loudnorm': {
-        const target = val('lufs') || -16;
-        const r = await this.edit({ kind: 'loudnorm', a, b, target });
-        if (r && r.over > 0) this.notice(`At ${target} LUFS this sound peaks ${r.over.toFixed(1)} dB over full scale. Use the Maximizer, or a lower target.`, 8000);
-        return;
-      }
-      case 'stretch': {
-        const pct = val('stretchlen') || 100, semis = val('semis') || 0;
-        if (!(pct > 0) || (pct === 100 && !semis)) return;
-        if (b - a < this.sr * 0.1) return this.notice('Select at least a tenth of a second');
-        return this.edit({ kind: 'stretch', a, b, length: pct / 100, semitones: semis });
-      }
-      case 'loopxfade': {
-        const n = Math.round((val('xfade') || 50) / 1000 * this.sr);
-        if (b - a < 4 || n < 1) return;
-        if (n > (b - a) / 2) return this.notice('The crossfade can be at most half of the loop');
-        const r = await this.edit({ kind: 'loopxfade', a, b, n });
-        if (r && !this.loop) this.action('loop');
-        return;
-      }
-      case 'declick': {
-        const r = await this.edit({ kind: 'declick', a, b, sensitivity: val('clicksens') || 5 });
-        if (r?.info) this.notice(r.info[0].toUpperCase() + r.info.slice(1));
-        return;
-      }
-      case 'transients': return this.editRegions({ op: 'hits', a, b, sensitivity: val('onsetsens') || 5, th: this.threshold() });
+      case 'transients': return this.editRegions({ op: 'hits', a, b, sensitivity: this.num('onsetsens') || 5, th: this.threshold() });
       case 'gridslice': {
-        const bpm = val('bpm'), per = val('perbeat') || 1;
+        const bpm = this.num('bpm'), per = this.num('perbeat') || 1;
         return this.editRegions({ op: 'grid', a, b, step: bpm > 0 ? this.sr * 60 / bpm / per : 0 });
       }
       case 'snap': {
@@ -729,12 +711,12 @@ export class Editor {
       case 'trimsilence': return this.edit({ kind: 'trimsilence', th: this.trimThreshold() });
       case 'prep': return this.edit({
         kind: 'prep', th: this.threshold(),
-        db: Number(this.settings?.prep_target_db ?? (val('norm') || -1)),
+        db: Number(this.settings?.prep_target_db ?? this.num('norm')),
         fade_in_ms: this.settings?.prep_fade_in_ms ?? 2, fade_out_ms: this.settings?.prep_fade_out_ms ?? 10,
       });
       case 'addregion': if (!needSel()) return;
         return this.editRegions({ op: 'add', a: /** @type {Span} */ (this.sel)[0], b: /** @type {Span} */ (this.sel)[1] });
-      case 'autoslice': return this.editRegions({ op: 'auto', th: this.threshold(), gap_ms: val('gap') || 250 });
+      case 'autoslice': return this.editRegions({ op: 'auto', th: this.threshold(), gap_ms: this.num('gap') || 250 });
       case 'clearregions': if (!this.regions.length) return;
         return this.editRegions({ op: 'clear' });
       case 'exportregions': return this.exportRegions();
@@ -745,36 +727,44 @@ export class Editor {
           const res = await this.onSave(this.renderOpts({ mono: this.settings?.sp404_mono || this.settings?.export_mono, rate: 48000, bits: 16 }), dir, this.fileName(), { sp404: true });
           if (res) this.toast(`Saved for SP-404MKII: ${res}`, 5000);
         });
-      case 'save': case 'saveto': return this.save();
+      case 'save': return this.save();
       case 'download':
-        return invoke('ed_download', { p: this.renderOpts(), name: this.fileName('wav') })
-          .then((path) => { if (path) this.toast(`Saved ${path.split('/').pop()}`); }, (e) => this.notice(String(e?.message || e)));
+        return doc.download(this.renderOpts(), this.fileName('wav'))
+          .then((path) => { if (path) this.toast(`Saved ${path.split('/').pop()}`); }, (/** @type {Failure} */ e) => this.notice(e.message));
     }
   }
 
-  // Play the range `ratio` times faster: pitch and length change together, as on a sampler.
-  /** @param {number} ratio */
-  respeed(ratio) {
-    const [a, b] = this.range();
-    if (b - a < 2) return;
-    return this.edit({ kind: 'respeed', a, b, ratio });
+  // Apply, for the tools whose edit toolEdit builds. Resolves with something truthy once the
+  // sound is as the tool's values ask, which includes values that ask for no change; with null
+  // when the tool refused or its edit failed.
+  /** @param {string} name */
+  async applyTool(name) {
+    const num = (/** @type {string} */ f) => this.num(f);
+    const refusal = toolRefusal(name, num, this.range(), this.sr);
+    if (refusal) this.notice(refusal);
+    if (refusal != null) return refusal === '' ? true : null;
+    const p = this.toolEdit(name);
+    if (!p) return null;
+    const r = await this.edit(p);
+    if (!r) return null;
+    if (name === 'loudnorm' && r.over > 0) this.notice(`At ${p.target} LUFS this sound peaks ${r.over.toFixed(1)} dB over full scale. Use the Maximizer, or a lower target.`, 8000);
+    if (name === 'loopxfade' && !this.loop) this.action('loop');
+    if (name === 'declick' && r.info) this.notice(r.info[0].toUpperCase() + r.info.slice(1));
+    return r;
   }
 
-  // Where the fades go: the fade in over the first part of the selection (or of the whole sound),
-  // the fade out over its last part, each as long as its ruler says.
   rangeMs() { const [a, b] = this.range(); return Math.round((b - a) / this.sr * 1000); }
-  fadeSpans() {
-    const [a, b] = this.range(), len = (/** @type {string} */ f) => Math.max(0, Math.min(b - a, Math.round((Number(this.$(`[data-f=${f}]`).value) || 0) / 1000 * this.sr)));
-    return [{ a, b: a + len('fadeinlen'), fadeIn: true }, { a: b - len('fadeoutlen'), b, fadeIn: false }];
-  }
-  threshold() { return Math.pow(10, Number(this.$('[data-f=thresh]').value || -45) / 20); }
+  // The fade in and the fade out of the Fade tool, over the range (see fadeSpans in tools.js).
+  fadeSpans() { return fadeSpans((f) => this.num(f), this.range(), this.sr); }
+  // The level, as an amplitude, below which the slicers and Prepare take the sound for silence.
+  threshold() { return Math.pow(10, Number(this.field('thresh').value || -45) / 20); }
   // The level Trim silent ends cuts below. Its ruler starts at the bottom, which cuts nothing.
-  trimThreshold() { const db = Number(this.$('[data-f=trimthresh]').value); return db <= -96 ? 0 : Math.pow(10, db / 20); }
+  trimThreshold() { const db = this.num('trimthresh'); return db <= -96 ? 0 : Math.pow(10, db / 20); }
   // What Trim silent ends would keep at its current level, worked out once per sound and level.
   // Null until it is known; the waveform redraws when it arrives.
   /** @returns {Span | null} */
   trimBounds() {
-    const key = `${this.version}|${this.$('[data-f=trimthresh]').value}`;
+    const key = `${this.version}|${this.field('trimthresh').value}`;
     if (this.trimKept?.key !== key) {
       this.trimKept = { key, r: null };
       this.soundBounds(this.trimThreshold()).then((r) => { const kept = /** @type {{ key: string, r: Span | null }} */ (this.trimKept); if (kept.key === key) { kept.r = r; this.draw(); } }).catch(() => { });
@@ -783,10 +773,10 @@ export class Editor {
   }
   // The span from the first to the last sample above the threshold, padded by 5 ms; null when all is below.
   /** @returns {Promise<Span | null>} */
-  soundBounds(th = this.threshold()) { return invoke('ed_analyse', { p: { kind: 'bounds', th } }); }
+  soundBounds(th = this.threshold()) { return doc.analyse({ kind: 'bounds', th }); }
   // For each position, the nearest point within 10 ms where the sum of all channels crosses zero.
   /** @param {number[]} at @returns {Promise<number[]>} */
-  zeroCross(at) { return invoke('ed_analyse', { p: { kind: 'zerocross', at } }); }
+  zeroCross(at) { return doc.analyse({ kind: 'zerocross', at }); }
   renderRegions() {
     const box = this.$('[data-f=regions]'); if (!box) return;
     box.innerHTML = '';
@@ -802,7 +792,6 @@ export class Editor {
       /** @type {Element} */ (row.querySelector('[data-r=select]')).textContent = r.name || String(i + 1).padStart(2, '0');
       row.dataset.tip += ' Double-click the name to change it.';
       const rename = async () => {
-        if (!this.ask) return;
         const name = await this.ask(`Name of region ${i + 1}`, r.name || '');
         if (name != null) this.editRegions({ op: 'rename', i, name });
       };
@@ -820,10 +809,10 @@ export class Editor {
   }
   async exportRegions() {
     if (!this.regions.length) return this.notice('Add or auto-detect regions first');
-    const target = await this.target('Save each region as a new file'); if (!target) return;
+    const target = await this.whereToSave('Save each region as a new file'); if (!target) return;
     const dir = target.dir;
     const suffix = this.settings?.edit_suffix ?? '_edit';
-    let base = this.$('[data-f=name]').value || 'sample';
+    let base = this.field('name').value || 'sample';
     if (suffix && base.endsWith(suffix) && base.length > suffix.length) base = base.slice(0, -suffix.length);
     // No edit is taken while the files are written, so every file comes from the same sound.
     const regions = this.regions.map(r => ({ ...r })), opts = { format: this.format(), source: this.path, project: target.project };
@@ -840,20 +829,14 @@ export class Editor {
   // How to render [a, b) of the sound for saving: rate and depth from the save options.
   /** @param {{ a?: number, b?: number, mono?: boolean, rate?: number, bits?: number }} [o] */
   renderOpts({ a = 0, b = this.length, mono = this.settings?.export_mono, rate = 0, bits = 0 } = {}) {
-    return { a, b, rate: rate || Number(this.$('[data-f=rate]').value) || this.sr, bits: bits || Number(this.$('[data-f=bits]').value), mono: !!mono };
+    return { a, b, rate: rate || this.num('rate') || this.sr, bits: bits || this.num('bits'), mono: !!mono };
   }
 
-  format() { return this.$('[data-f=format]')?.value || 'wav'; }
-  fileName(ext = this.format()) { return (this.$('[data-f=name]').value || 'untitled') + '.' + ext; }
-  // Where a new file goes: asked every time, since a save never replaces a file.
-  /** @param {string} [title] @returns {Promise<SaveTarget | null>} */
-  async target(title) {
-    if (this.whereToSave) return this.whereToSave(title);
-    const dir = this.dir || await this.pickFolder();
-    return dir ? { dir, where: dir } : null;
-  }
+  format() { return this.field('format').value || 'wav'; }
+  fileName(ext = this.format()) { return (this.field('name').value || 'untitled') + '.' + ext; }
+  // Where a new file goes is asked every time, since a save never replaces a file.
   async save() {
-    const target = await this.target(); if (!target) return;
+    const target = await this.whereToSave(); if (!target) return;
     // An edit made, or another file opened, while the save runs must not be marked as saved.
     const file = this.fileId, version = this.version, from = this.path && this.name;
     const res = await this.onSave(this.renderOpts(), target.dir, this.fileName(), { format: this.format(), source: this.path, project: target.project });
@@ -862,39 +845,23 @@ export class Editor {
     this.notice(`Saved ${name} into ${target.where}.${from ? ` ${from} is unchanged.` : ''}`, 7000);
     if (this.fileId === file) {
       // The editor now shows the saved file: later region changes and saves belong to it.
-      this.dir = res.slice(0, res.lastIndexOf('/')); this.savedOnce = true;
-      const st = await invoke('ed_saved', { path: res, version }); this.isDirty = st.dirty; this.path = st.path;
+      this.dir = res.slice(0, res.lastIndexOf('/'));
+      const st = await doc.saved(res, version); this.isDirty = st.dirty; this.path = st.path;
       this.name = name; this.$('[data-f=title]').textContent = this.name;
-      this.infoSig = null;
-      this.updateInfo();
+      this.refreshInfo();
     }
   }
 
-  // The edit a tool makes with its current values, as sent to the native side; null when its
-  // values make no change.
+  // The edit the tool `name` makes over the range with its current values; null when they make none.
   /** @param {string} name */
-  toolEdit(name) {
-    const [a, b] = this.range(), sr = this.sr, val = (/** @type {string} */ f) => Number(this.$(`[data-f=${f}]`).value);
-    switch (name) {
-      case 'gain': return { kind: 'gain', a, b, db: val('gain') || 0 };
-      case 'normalize': return { kind: 'normalize', a, b, db: val('norm') };
-      case 'loudnorm': return { kind: 'loudnorm', a, b, target: val('lufs') };
-      case 'fade': return { kind: 'fade', spans: this.fadeSpans().filter(m => m.b > m.a) };
-      case 'declick': return { kind: 'declick', a, b, sensitivity: val('clicksens') || 5 };
-      case 'speed': { const pct = val('speed'); return pct > 0 ? { kind: 'respeed', a, b, ratio: pct / 100 } : null; }
-      case 'tune': return { kind: 'respeed', a, b, ratio: Math.pow(2, (val('tunesemis') || 0) / 12) };
-      case 'stretch': { const pct = val('stretchlen'); return pct > 0 && b - a >= sr * 0.1 ? { kind: 'stretch', a, b, length: pct / 100, semitones: val('semis') || 0 } : null; }
-      case 'loopxfade': { const n = Math.round(val('xfade') / 1000 * sr); return b - a >= 4 && n >= 1 && n <= (b - a) / 2 ? { kind: 'loopxfade', a, b, n } : null; }
-    }
-    return null;
-  }
+  toolEdit(name) { return toolEdit(name, (f) => this.num(f), this.range(), this.sr); }
   // The whole sound as it would be after the tool, for drawing and for Play while it is open:
   // { src, length }, or null.
   /** @param {string} name @param {string} key */
   async toolFull(name, key) {
     const p = this.toolEdit(name);
     if (!p) return null;
-    const r = await invoke('ed_view', { key, p, headS: null });
+    const r = await doc.view(key, p);
     return { src: key, length: r.length };
   }
   // The sound a tool would produce, for listening before applying: { src, a, b, from }, where
@@ -908,20 +875,19 @@ export class Editor {
     if (name === 'fade') {
       const [from, to] = this.fadeExcerpt();
       if (to <= from) return null;
-      await invoke('ed_view', { key, p, headS: null });
+      await doc.view(key, p);
       return { src: key, a: from, b: to, from };
     }
     if (name === 'loopxfade') {
-      const r = await invoke('ed_view', { key, p, headS: null });
+      const r = await doc.view(key, p);
       return { src: key, a, b: a + (r.n ?? 0), from: a };
     }
-    const r = await invoke('ed_view', { key, p, headS: AUDITION_S });
+    const r = await doc.view(key, p, AUDITION_S);
     return { src: key, a: 0, b: r.length, from: a };
   }
   /** Plays what the open tool `name` would make; nothing when that tool is not the one open. @param {string | null} name */
   async audition(name) {
-    if (!name) return;
-    if (this.fx?.toolName !== name) return;
+    if (!name || this.fx.toolName !== name) return;
     const id = this.auditionId = (this.auditionId || 0) + 1;
     let seg = null;
     try {
@@ -932,8 +898,8 @@ export class Editor {
         seg = { src: 'doc', a, b, from: a };
       }
       else seg = await this.toolSegment(name);
-    } catch (e) { this.notice(String(/** @type {Error} */ (e)?.message || e)); }
-    if (this.fx?.toolName !== name || id !== this.auditionId) return;
+    } catch (e) { this.notice(/** @type {Failure} */ (e).message); }
+    if (this.fx.toolName !== name || id !== this.auditionId) return;
     this.onAudition?.();
     this.stopAudition(false); this.stopPlay(false);
     if (!seg || seg.b <= seg.a) return;
@@ -947,9 +913,9 @@ export class Editor {
     this.auditioning = true;
     this.aud = { t: now() + 0.03, from: seg.from, len, off, loop };
     let r;
-    try { r = await invoke('ed_play', { p: { src: seg.src, a: seg.a, b: seg.b, start: seg.a + off, loop, fade_in: AUDITION_FADE_IN_S, fade_out: AUDITION_FADE_S } }); }
+    try { r = await doc.play({ src: seg.src, a: seg.a, b: seg.b, start: seg.a + off, loop, fade_in: AUDITION_FADE_IN_S, fade_out: AUDITION_FADE_S }); }
     catch { if (this.auditionToken === token) { this.auditioning = false; this.draw(); } return; }
-    if (this.auditionToken !== token) return void invoke('ed_stop', { id: r.id }).catch(() => { });
+    if (this.auditionToken !== token) return void doc.stop(r.id);
     this.auditionVoice = r.id; this.aud.t = r.at;
     onEnded(r.id, () => { if (this.auditionVoice === r.id) { this.auditionVoice = null; this.auditioning = false; this.draw(); } });
     const tick = () => { if (this.auditionToken !== token || !this.auditioning) return; this.draw(); requestAnimationFrame(tick); };
@@ -967,66 +933,25 @@ export class Editor {
     this.auditioning = false;
     requestAnimationFrame(() => this.draw());
     const v = this.auditionVoice; this.auditionVoice = null;
-    if (v != null) { forget(v); if (send) invoke('ed_stop', { id: v, fade: AUDITION_FADE_S }).catch(() => { }); }
+    if (v != null) { forget(v); if (send) doc.stop(v, AUDITION_FADE_S); }
   }
-  // ---- toolbar menus
-  bindMenus() {
-    const menus = /** @type {HTMLElement[]} */ ([...this.root.querySelectorAll('.tmenu')]);
-    const parts = (/** @type {Element} */ m) => /** @type {[HTMLElement, HTMLElement]} */ ([m.querySelector('.tmenu-btn'), m.querySelector('.tmenu-list')]);
-    const isOpen = (/** @type {Element} */ m) => !parts(m)[1].hidden;
-    const close = (/** @type {Element} */ m) => { const [btn, list] = parts(m); list.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
-    const open = (/** @type {Element} */ m) => {
-      menus.forEach(o => o !== m && close(o));
-      const [btn, list] = parts(m);
-      list.hidden = false; btn.setAttribute('aria-expanded', 'true');
-      // Keep the list inside the window when its menu sits near the right edge.
-      list.style.left = '0';
-      const over = list.getBoundingClientRect().right - (window.innerWidth - 8);
-      if (over > 0) list.style.left = -over + 'px';
-    };
-    const step = (/** @type {Element} */ m, /** @type {number} */ dir) => {
-      const items = [...parts(m)[1].querySelectorAll('button:not([hidden])')], i = items.indexOf(/** @type {Element} */ (document.activeElement));
-      items[(i + dir + items.length) % items.length]?.focus();
-    };
-    for (const m of menus) {
-      const [btn, list] = parts(m);
-      btn.addEventListener('click', () => { if (!this.loaded) return; isOpen(m) ? close(m) : open(m); });
-      btn.addEventListener('mouseenter', () => { if (menus.some(isOpen) && !isOpen(m)) open(m); });
-      list.addEventListener('click', (e) => { if (/** @type {Element} */ (e.target).closest('[role=menuitem]')) close(m); });
-      m.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && isOpen(m)) { e.preventDefault(); e.stopPropagation(); close(m); btn.focus(); }
-        else if (/** @type {Element} */ (e.target).matches('input, select')) return;
-        else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-          e.preventDefault(); e.stopPropagation();
-          if (!isOpen(m)) { if (!this.loaded) return; open(m); }
-          step(m, e.key === 'ArrowDown' ? 1 : -1);
-        } else if ((e.key === 'ArrowRight' || e.key === 'ArrowLeft') && isOpen(m)) {
-          e.preventDefault(); e.stopPropagation();
-          const next = menus[(menus.indexOf(m) + (e.key === 'ArrowRight' ? 1 : -1) + menus.length) % menus.length];
-          open(next); parts(next)[0].focus();
-        }
-      });
-    }
-    document.addEventListener('mousedown', (e) => { if (/** @type {Element} */ (e.target).closest?.('.dd-menu')) return; for (const m of menus) if (isOpen(m) && !m.contains(/** @type {Node} */ (e.target))) close(m); });
-  }
-
   // What is played to judge a fade: the fade last adjusted, with a second of the sound beside it.
   fadeExcerpt() {
     const [fin, fout] = this.fadeSpans(), most = Math.round(this.sr * AUDITION_S), [a, b] = this.range();
-    const out = this.fx?.lastField === 1 || fin.b <= fin.a;
+    const out = this.fx.lastField === 1 || fin.b <= fin.a;
     return out ? [Math.max(a, fout.a - this.sr, b - most), b] : [a, Math.min(b, fin.b + this.sr, a + most)];
   }
   // The inner edge of each fade can be dragged on the waveform.
   /** @param {number} x */
   fadeEdgeAt(x) {
     if (!this.loaded) return null;
-    return (this.fx?.toolMark() || []).find((/** @type {FadeSpan} */ m) => Math.abs(this.sampleToX(m.fadeIn ? m.b : m.a) - x) <= 6) || null;
+    return (this.fx.toolMark() || []).find((m) => Math.abs(this.sampleToX(m.fadeIn ? m.b : m.a) - x) <= 6) || null;
   }
   /** @param {number} s @param {boolean} fadeIn */
   dragFade(s, fadeIn) {
-    const [a, b] = this.range(), f = this.$(`[data-f=${fadeIn ? 'fadeinlen' : 'fadeoutlen'}]`);
+    const [a, b] = this.range();
     const ms = Math.round((fadeIn ? s - a : b - s) / this.sr * 1000);
-    f.value = Math.max(0, Math.min(this.rangeMs(), ms));
+    this.setNum(fadeIn ? 'fadeinlen' : 'fadeoutlen', Math.max(0, Math.min(this.rangeMs(), ms)));
     this.fx.lastField = fadeIn ? 0 : 1;
     this.fx.toolSync?.();
   }
@@ -1037,9 +962,9 @@ export class Editor {
     this.root.addEventListener('click', (e) => {
       const b = /** @type {Element} */ (e.target).closest('[data-a]'); if (!b) return;
       const a = /** @type {string} */ (b.dataset.a);
-      if (/** @type {Record<string, unknown>} */ (TOOLS)[a] && this.loaded) this.fx.openTool(a); else this.action(a);
+      if (TOOLS[a] && this.loaded) this.fx.openTool(a); else this.action(a);
     });
-    this.bindMenus();
+    bindMenus(this.root, () => !!this.loaded);
     /** @type {number | null} */ let dragFrom = null;
     let moved = false;
     /** @type {FadeSpan | null} */ let fadeDrag = null;
@@ -1087,11 +1012,54 @@ export class Editor {
       ' ': 'play', 'z': mod && (e.shiftKey ? 'redo' : 'undo'), 'a': mod && 'all', 'c': mod && 'copy',
       'x': mod && 'cut', 'v': mod && 'paste', 't': mod && 'trim', 'Backspace': 'delete', 'Delete': 'delete',
       '=': 'zoomin', '+': 'zoomin', '-': 'zoomout', 'f': !mod && 'fit', 'e': !mod && 'zoomsel', 'l': !mod && 'loop', 'b': !mod && 'ab',
-      'r': !mod && 'addregion', 's': mod && (e.shiftKey ? 'saveto' : 'save'),
+      'r': !mod && 'addregion', 's': mod && 'save',
       'Home': 'home', 'End': 'end', 'Escape': this.sel && 'deselect',
     };
     const act = map[e.key.length === 1 ? e.key.toLowerCase() : e.key];
     if (!act) return false;
     e.preventDefault(); this.action(act); return true;
   }
+}
+
+// The toolbar's menus: one open at a time, opened by a click or, once one is open, by moving
+// onto another; the arrow keys move through and between them. They stay shut until a sound is open.
+/** @param {HTMLElement} root @param {() => boolean} isLoaded */
+function bindMenus(root, isLoaded) {
+  const menus = /** @type {HTMLElement[]} */ ([...root.querySelectorAll('.tmenu')]);
+  const parts = (/** @type {Element} */ m) => /** @type {[HTMLElement, HTMLElement]} */ ([m.querySelector('.tmenu-btn'), m.querySelector('.tmenu-list')]);
+  const isOpen = (/** @type {Element} */ m) => !parts(m)[1].hidden;
+  const close = (/** @type {Element} */ m) => { const [btn, list] = parts(m); list.hidden = true; btn.setAttribute('aria-expanded', 'false'); };
+  const open = (/** @type {Element} */ m) => {
+    menus.forEach(o => o !== m && close(o));
+    const [btn, list] = parts(m);
+    list.hidden = false; btn.setAttribute('aria-expanded', 'true');
+    // Keep the list inside the window when its menu sits near the right edge.
+    list.style.left = '0';
+    const over = list.getBoundingClientRect().right - (window.innerWidth - 8);
+    if (over > 0) list.style.left = -over + 'px';
+  };
+  const step = (/** @type {Element} */ m, /** @type {number} */ dir) => {
+    const items = [...parts(m)[1].querySelectorAll('button:not([hidden])')], i = items.indexOf(/** @type {Element} */ (document.activeElement));
+    items[(i + dir + items.length) % items.length]?.focus();
+  };
+  for (const m of menus) {
+    const [btn, list] = parts(m);
+    btn.addEventListener('click', () => { if (!isLoaded()) return; isOpen(m) ? close(m) : open(m); });
+    btn.addEventListener('mouseenter', () => { if (menus.some(isOpen) && !isOpen(m)) open(m); });
+    list.addEventListener('click', (e) => { if (/** @type {Element} */ (e.target).closest('[role=menuitem]')) close(m); });
+    m.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && isOpen(m)) { e.preventDefault(); e.stopPropagation(); close(m); btn.focus(); }
+      else if (/** @type {Element} */ (e.target).matches('input, select')) return;
+      else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault(); e.stopPropagation();
+        if (!isOpen(m)) { if (!isLoaded()) return; open(m); }
+        step(m, e.key === 'ArrowDown' ? 1 : -1);
+      } else if ((e.key === 'ArrowRight' || e.key === 'ArrowLeft') && isOpen(m)) {
+        e.preventDefault(); e.stopPropagation();
+        const next = menus[(menus.indexOf(m) + (e.key === 'ArrowRight' ? 1 : -1) + menus.length) % menus.length];
+        open(next); parts(next)[0].focus();
+      }
+    });
+  }
+  document.addEventListener('mousedown', (e) => { if (/** @type {Element} */ (e.target).closest?.('.dd-menu')) return; for (const m of menus) if (isOpen(m) && !m.contains(/** @type {Node} */ (e.target))) close(m); });
 }
