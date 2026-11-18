@@ -7,7 +7,10 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, MAIN_SEPARATOR};
 use super::index::{move_project_places, rekey};
 use super::paths::{basename, expand, is_inside, mtime_of, nfc, safe_name};
-use super::{Job, Library, Res, query_one, query_rows, report};
+use super::{Job, Library, Res, query_one, query_rows};
+
+/// How many unreadable files a folder names; the rest are only counted.
+const FAILED_NAMED: usize = 5;
 
 impl Library {
     pub fn folders(&self) -> Vec<String> {
@@ -29,18 +32,28 @@ impl Library {
 
     pub fn folder_counts(&self) -> Value {
         let folders = self.folders();
-        let counts: HashMap<String, (i64, i64, i64)> = self
-            .rows("SELECT folder, COUNT(*), SUM(emb IS NOT NULL), COALESCE(SUM(size), 0) FROM files GROUP BY folder", [], |r| {
-                Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), (r.get(1)?, r.get(2)?, r.get(3)?)))
+        let counts: HashMap<String, (i64, i64, i64, i64)> = self
+            .rows("SELECT folder, COUNT(*), SUM(emb IS NOT NULL), COALESCE(SUM(size), 0), SUM(error IS NOT NULL) FROM files GROUP BY folder", [], |r| {
+                Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
             })
             .into_iter()
             .collect();
+        // The first few files that could not be read, with the reason, for the folder's row to name.
+        let mut failed: HashMap<String, Vec<Value>> = HashMap::new();
+        for (folder, path, error) in self.rows("SELECT folder, path, error FROM files WHERE error IS NOT NULL ORDER BY path", [], |r| {
+            Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        }) {
+            let list = failed.entry(folder).or_default();
+            if list.len() < FAILED_NAMED {
+                list.push(json!({"path": path, "error": error}));
+            }
+        }
         Value::Array(
             folders
                 .iter()
                 .map(|f| {
-                    let c = counts.get(f).copied().unwrap_or((0, 0, 0));
-                    json!({"path": f, "files": c.0, "indexed": c.1, "bytes": c.2, "offline": !Path::new(f).is_dir()})
+                    let c = counts.get(f).copied().unwrap_or((0, 0, 0, 0));
+                    json!({"path": f, "files": c.0, "indexed": c.1, "bytes": c.2, "failed": c.3, "failed_files": failed.get(f).cloned().unwrap_or_default(), "offline": !Path::new(f).is_dir()})
                 })
                 .collect(),
         )
@@ -66,21 +79,24 @@ impl Library {
         Ok(p)
     }
 
-    pub fn remove_folder(&self, path: &str) {
-        if let Some(w) = self.watcher.lock().unwrap().as_ref() {
-            let _ = w.send((false, path.to_string()));
-        }
-        self.unwatched.lock().unwrap().remove(path);
+    pub fn remove_folder(&self, path: &str) -> Res<()> {
         let gone = self.write(|db| {
             db.execute("DELETE FROM folders WHERE path=?", [path])?;
             let gone: Vec<String> = query_rows(db, "SELECT path FROM files WHERE folder=?", [path], |r| r.get(0));
             db.execute("DELETE FROM files WHERE folder=?", [path])?;
             Ok(gone)
         });
+        let gone = gone.map_err(|e| format!("The folder could not be removed: {e}"))?;
+        // Only once the database has let go of it: on a failure the folder is still watched.
+        if let Some(w) = self.watcher.lock().unwrap().as_ref() {
+            let _ = w.send((false, path.to_string()));
+        }
+        self.unwatched.lock().unwrap().remove(path);
         let mut s = self.store.write().unwrap();
-        for p in report("removing a folder", gone).unwrap_or_default() {
+        for p in gone {
             s.drop_path(&p);
         }
+        Ok(())
     }
 
     pub fn rescan(&self) {

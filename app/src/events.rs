@@ -1,7 +1,8 @@
 //! What the page is told without asking: the engine clock, sounds that ended, the Arranger's
-//! passes, the spectrum while the EQ shows it, and a take's progress while recording.
+//! passes, the spectrum while the EQ shows it, a take's progress while recording, and the
+//! library's status when it changes.
 
-use crate::{arr::Arr, engine::Engine, input::Input};
+use crate::{arr::Arr, engine::Engine, input::Input, library::Library};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,6 +13,10 @@ use tauri::{AppHandle, Emitter, Manager};
 const CLOCK: Duration = Duration::from_millis(250);
 const SPECTRUM: Duration = Duration::from_millis(33);
 const RECORDING: Duration = Duration::from_millis(40);
+/// The library's status is looked at this often, and sent when it has changed. While sounds are
+/// analysed only the counts move, and those are sent at most once in STATUS_COUNTS.
+const STATUS: Duration = Duration::from_millis(250);
+const STATUS_COUNTS: Duration = Duration::from_secs(1);
 
 #[derive(Default)]
 pub struct Watch {
@@ -21,7 +26,9 @@ pub struct Watch {
 pub fn start(app: AppHandle) {
     std::thread::spawn(move || {
         let engine = app.state::<Arc<Engine>>().inner().clone();
+        let lib = app.state::<Arc<Library>>().inner().clone();
         let (mut clock, mut spec, mut rec) = (Instant::now() - CLOCK, Instant::now(), Instant::now());
+        let (mut status_seen, mut status_sent, mut status_at) = (Instant::now() - STATUS, serde_json::Value::Null, Instant::now());
         let mut arr_seen = 0;
         loop {
             std::thread::sleep(Duration::from_millis(5));
@@ -36,6 +43,20 @@ pub fn start(app: AppHandle) {
             if app.state::<Watch>().spectrum.load(Ordering::Relaxed) && spec.elapsed() >= SPECTRUM {
                 spec = Instant::now();
                 let _ = app.emit("spectrum", engine.spectrum());
+            }
+            if status_seen.elapsed() >= STATUS {
+                status_seen = Instant::now();
+                let now = lib.status();
+                // Whether work is going on, and everything but its counts.
+                let shape = |s: &serde_json::Value| {
+                    let busy = s["pending_jobs"].as_i64().unwrap_or(0) > 0 || s["done"].as_i64() < s["queued"].as_i64();
+                    (busy, s["model"].clone(), s["error"].clone(), s["folder"].clone())
+                };
+                if now != status_sent && (shape(&now) != shape(&status_sent) || status_at.elapsed() >= STATUS_COUNTS) {
+                    status_at = Instant::now();
+                    let _ = app.emit("status", &now);
+                    status_sent = now;
+                }
             }
             let input = app.state::<Input>();
             if input.recording() && rec.elapsed() >= RECORDING {

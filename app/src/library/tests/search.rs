@@ -82,6 +82,37 @@ fn the_sound_map_places_every_sound_inside_the_unit_square() {
 }
 
 #[test]
+fn a_folder_names_the_files_that_could_not_be_read() {
+    let l = lab();
+    l.add("a.wav", 0);
+    let bad = l.path("broken.wav");
+    std::fs::write(&bad, b"this is not a sound").unwrap();
+    l.index(&[&bad]);
+    let f = &l.lib.folder_counts()[0];
+    assert_eq!((f["files"].as_i64(), f["indexed"].as_i64(), f["failed"].as_i64()), (Some(2), Some(1), Some(1)));
+    assert_eq!(f["failed_files"][0]["path"], bad);
+    assert!(!f["failed_files"][0]["error"].as_str().unwrap().is_empty());
+    // A file that is fixed is no longer counted.
+    l.add("broken.wav", 1);
+    assert_eq!(l.lib.folder_counts()[0]["failed"], 0);
+}
+
+#[test]
+fn a_write_the_database_refuses_is_reported() {
+    let l = lab();
+    let a = l.add("a.wav", 0);
+    let pid = l.kit("Kit");
+    l.lib.project_add(pid, &a).unwrap();
+    l.lib.db().execute_batch("CREATE TRIGGER no_delete BEFORE DELETE ON project_items BEGIN SELECT RAISE(ABORT, 'refused'); END; CREATE TRIGGER no_order BEFORE UPDATE ON project_items BEGIN SELECT RAISE(ABORT, 'refused'); END; CREATE TRIGGER no_folder BEFORE DELETE ON folders BEGIN SELECT RAISE(ABORT, 'refused'); END;").unwrap();
+    assert!(l.lib.project_remove(pid, &a).is_err());
+    assert!(l.lib.set_project_order(pid, &[a.clone()]).is_err());
+    assert!(l.lib.delete_project(pid).is_err());
+    assert!(l.lib.remove_folder(&l.folder).is_err());
+    // Nothing was dropped along the way: the sound is still listed.
+    assert_eq!(l.count(), 1);
+}
+
+#[test]
 fn folder_counts_include_the_size_on_disk() {
     let l = lab();
     let a = l.add("a.wav", 0);

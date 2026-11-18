@@ -148,7 +148,7 @@ impl Library {
         self.exec("UPDATE projects SET name=? WHERE id=?", params![name.trim(), pid]).map(|_| ()).map_err(|_| "A project with that name already exists".into())
     }
 
-    pub fn delete_project(&self, pid: i64) {
+    pub fn delete_project(&self, pid: i64) -> Res<()> {
         if let Some(f) = self.project_folder(pid) {
             let mut gone: Vec<String> = self.dismissed_folders().into_iter().collect();
             gone.push(f);
@@ -156,7 +156,7 @@ impl Library {
             gone.dedup();
             report("remembering a deleted project", self.meta_set("projects_dismissed", &serde_json::to_string(&gone).unwrap()));
         }
-        report("deleting a project", self.write(|db| Self::remove_project(db, pid)));
+        self.write(|db| Self::remove_project(db, pid)).map_err(|e| format!("The project could not be deleted: {e}"))
     }
 
     /// The project's folder, checked to exist and to be inside the library.
@@ -237,8 +237,8 @@ impl Library {
         Ok(())
     }
 
-    pub fn project_remove(&self, pid: i64, path: &str) {
-        report("taking a sound out of a project", self.exec("DELETE FROM project_items WHERE project_id=? AND path=?", params![pid, path]));
+    pub fn project_remove(&self, pid: i64, path: &str) -> Res<()> {
+        self.exec("DELETE FROM project_items WHERE project_id=? AND path=?", params![pid, path]).map(|_| ()).map_err(|e| format!("The sound could not be taken out of the project: {e}"))
     }
 
     pub(super) fn project_paths(&self, pid: i64) -> HashSet<String> {
@@ -249,8 +249,8 @@ impl Library {
         Value::Array(self.rows("SELECT path FROM project_items WHERE project_id=? ORDER BY pos IS NULL, pos, path", [pid], |r| r.get(0).map(Value::String)))
     }
 
-    pub fn set_project_order(&self, pid: i64, paths: &[String]) {
-        report("ordering a project", self.write(|db| Self::place_in_order(db, pid, paths)));
+    pub fn set_project_order(&self, pid: i64, paths: &[String]) -> Res<()> {
+        self.write(|db| Self::place_in_order(db, pid, paths)).map_err(|e| format!("The order could not be saved: {e}"))
     }
 
     pub(super) fn place_in_order(db: &Connection, pid: i64, paths: &[String]) -> rusqlite::Result<()> {

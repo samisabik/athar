@@ -14,7 +14,7 @@ fn an_export_follows_the_project_order() {
     let (a, b) = (l.add("a.wav", 1), l.add("b.wav", 2));
     l.lib.project_add(pid, &a).unwrap();
     l.lib.project_add(pid, &b).unwrap();
-    l.lib.set_project_order(pid, &[b, a]);
+    l.lib.set_project_order(pid, &[b, a]).unwrap();
     let out = l.lib.export_project(pid, &l.root.join("out").to_string_lossy(), "{n:03d}_{name}", "copy").unwrap();
     let files: Vec<String> = out["files"].as_array().unwrap().iter().map(|f| basename(f.as_str().unwrap())).collect();
     assert_eq!(files, vec!["001_b.wav", "002_a.wav"]);
