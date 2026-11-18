@@ -1,38 +1,60 @@
-// The sidebar: folders, categories, projects and their pads.
+// The Library's folders, the kinds of sound, and the projects with their sounds and pads.
 
-import { $, el, ib, icon, fail, notice, modal, confirmModal, focusable, pickFolder } from './ui.js';
+import { $, el, ib, icon, fail, notice, modal, confirmModal, focusable, pickFolder, remember, recall } from './ui.js';
 import { fmtTime } from './time.js';
 import { lib } from './native.js';
 import { state } from './store.js';
 import { SETTINGS } from './settings.js';
+import { baseOf, stemOf, plural } from './names.js';
+import { isPlaying, togglePreview, previewButton } from './preview.js';
+import { showView } from './views.js';
+import { batch } from './batch.js';
+import { openPath } from './editing.js';
+import { dropZone, miniWave, search, syncIdleSearch } from './search.js';
 
 /** @typedef {import('./search.js').Item} Item */
 /** @typedef {import('./search.js').Project} Project */
 /** @typedef {import('./search.js').Folder} Folder */
 /** @typedef {import('./search.js').Sub} Sub */
-/** @typedef {import('./search.js').Main} Main */
-/** @typedef {typeof import('./search.js')} Search */
 /** Shows a folder's sounds in the Library, or only those under `under`. @typedef {(f: Folder, under?: string | null) => void} Show */
 
+export function refreshSide() { loadFolders().catch(fail); loadCats().catch(fail); loadProjects().catch(fail); }
+// A file that was just saved or copied is analysed in the background. Its folder's and its
+// project's counts are right once that is done, so they are read again a moment later.
+const INDEX_WAIT_MS = 2500;
+export function refreshSideSoon() { setTimeout(refreshSide, INDEX_WAIT_MS); }
 
-// What the sidebar uses from the rest of the window; main.js fills these in.
-/** @typedef {Pick<Main, 'batch' | 'isPlaying' | 'openPath' | 'refreshSide' | 'showView' | 'togglePreview'>
-      & Pick<Search, 'dropZone' | 'miniWave' | 'search' | 'syncIdleSearch'> & { editor: import('./editor.js').Editor }} SideHost */
-export const host = /** @type {SideHost} */ (/** @type {unknown} */ ({ editor: null }));
-// ---------- sidebar
-// Library folders page: the list picks a folder, the panel above shows it.
+// ---------- Library folders: the list picks a folder, which opens to show what is inside.
+/** The Library's folders as last read. @type {Folder[]} */
+let folders = [];
+export function hasFolders() { return folders.length > 0; }
 /** @type {string | null} */
 let folderSel = null, folderShut = false;
+/** Numbers each reading of the folders; one that finishes after a newer one was shown is dropped. */
+let folderSeq = 0, folderShown = 0;
 export async function loadFolders() {
+  const seq = ++folderSeq;
   /** @type {Folder[]} */
   const fs = await lib.folders();
-  const box = document.createDocumentFragment();
+  // Any answer newer than the one shown is taken: waiting for the very latest would show
+  // nothing while readings are asked for faster than they come back.
+  if (seq < folderShown) return;
+  folderShown = seq;
+  folders = fs;
   if (state.folder && !fs.some(f => f.path === state.folder)) { state.folder = null; state.under = null; }
   if (!fs.some(f => f.path === folderSel)) folderSel = (fs.find(f => f.path === state.folder) || fs[0])?.path ?? null;
-  if (!fs.length) box.append(host.dropZone());
+  document.querySelectorAll('[data-folders=list]').forEach(b => { b.textContent = fs.length ? 'Library folders' : 'No Library folders yet'; });
+  syncIdleSearch();
+  // The list itself asks for every open level of the tree, so it is built only while it shows.
+  if (state.currentView === 'folders') await renderFolders(seq);
+}
+/** @param {number} seq */
+async function renderFolders(seq) {
+  const box = document.createDocumentFragment();
+  if (!folders.length) box.append(dropZone());
   /** @type {Show} */
-  const show = (f, under = null) => { state.folder = f.path; state.under = under; loadFolders(); host.showView('sounds'); host.search(); };
-  for (const f of fs) {
+  const show = (f, under = null) => { state.folder = f.path; state.under = under; loadFolders().catch(fail); showView('sounds'); search(); };
+  for (const f of folders) {
     // A click opens a folder to show what is inside; a click on the open one closes it again.
     const open = folderSel === f.path && !folderShut;
     const pick = () => { folderShut = folderSel === f.path && !folderShut; folderSel = f.path; loadFolders().catch(fail); };
@@ -41,21 +63,23 @@ export async function loadFolders() {
       'data-tip': f.offline ? `${f.path} was not found, or its drive is not connected. Its sounds, tags and notes are kept.` : null,
       onclick: pick,
     },
-    el('span', { class: 'label' }, f.path.split('/').pop()),
-    el('span', { class: 'count' }, [folderState(f), `${f.files} sound${f.files === 1 ? '' : 's'}`, diskSize(f.bytes)].filter(Boolean).join(', ')),
+    el('span', { class: 'label' }, baseOf(f.path)),
+    el('span', { class: 'count' }, [folderState(f), plural(f.files, 'sound'), diskSize(f.bytes)].filter(Boolean).join(', ')),
     open ? folderActions(f, show) : null), pick));
     if (open && !f.offline) await appendTree(box, f, f.path, 1, show);
   }
-  $('#folders').replaceChildren(box);
-  document.querySelectorAll('[data-folders=list]').forEach(b => { b.textContent = fs.length ? 'Library folders' : 'No Library folders yet'; });
-  host.syncIdleSearch();
+  if (seq !== folderSeq) return;
+  // The list is rebuilt whole, also every second while sounds are analysed: the row that had the keyboard keeps it.
+  const list = $('#folders'), focused = [...list.children].indexOf(document.activeElement);
+  list.replaceChildren(box);
+  if (focused >= 0) list.children[focused]?.focus({ preventScroll: true });
 }
 
 // The subfolders of the picked folder, as an indented tree. A level opens when clicked.
 /** @type {Set<string>} */
-export const treeOpen = new Set();
+const treeOpen = new Set();
 /** @param {DocumentFragment} box @param {Folder} f @param {string} path @param {number} depth @param {Show} show */
-export async function appendTree(box, f, path, depth, show) {
+async function appendTree(box, f, path, depth, show) {
   /** @type {Sub[]} */
   let subs = [];
   try { subs = await lib.subfolders({ path }); } catch { return; }
@@ -70,7 +94,7 @@ export async function appendTree(box, f, path, depth, show) {
     },
     icon(sf.nested ? (open ? 'expand_more' : 'chevron_right') : 'folder'),
     el('span', { class: 'label' }, sf.name),
-    el('span', { class: 'count' }, `${sf.files} sound${sf.files === 1 ? '' : 's'}`),
+    el('span', { class: 'count' }, plural(sf.files, 'sound')),
     ib('queue_music', 'Show its sounds in the Library', (e) => { e.stopPropagation(); show(f, sf.path); }),
     ib('folder_open', 'Show in Finder', (e) => { e.stopPropagation(); revealFolder(sf.path); })), toggle));
     if (open && sf.nested) await appendTree(box, f, sf.path, depth + 1, show);
@@ -79,16 +103,16 @@ export async function appendTree(box, f, path, depth, show) {
 
 // What a folder is doing, and for the picked one the two things you can do with it.
 /** @param {Folder} f */
-export function folderState(f) {
+function folderState(f) {
   const waiting = f.files - f.indexed;
   return f.offline ? 'not found' : waiting > 0 ? `analysing ${waiting} more` : '';
 }
-export const revealFolder = (/** @type {string} */ path) => lib.revealFolder({ path }).catch(fail);
+const revealFolder = (/** @type {string} */ path) => lib.revealFolder({ path }).catch(fail);
 /** @param {number} n */
-export function diskSize(n) { return !n ? '' : n < 1e6 ? `${Math.max(1, Math.round(n / 1e3))} KB` : n < 1e9 ? `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0)} MB` : `${(n / 1e9).toFixed(1)} GB`; }
+function diskSize(n) { return !n ? '' : n < 1e6 ? `${Math.max(1, Math.round(n / 1e3))} KB` : n < 1e9 ? `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0)} MB` : `${(n / 1e9).toFixed(1)} GB`; }
 /** @param {Folder} f @param {Show} show */
-export function folderActions(f, show) {
-  const name = f.path.split('/').pop();
+function folderActions(f, show) {
+  const name = baseOf(f.path);
   return [
     ib('queue_music', 'Show its sounds in the Library', (e) => { e?.stopPropagation(); show(f); }),
     ib('folder_open', 'Show in Finder', (e) => { e?.stopPropagation(); revealFolder(f.path); }),
@@ -98,7 +122,7 @@ export function folderActions(f, show) {
       try { await lib.removeFolder({ path: f.path }); }
       catch (err) { return fail(err); }
       if (state.folder === f.path) { state.folder = null; state.under = null; }
-      host.refreshSide(); host.search();
+      refreshSide(); search();
     }),
   ];
 }
@@ -114,19 +138,21 @@ export async function loadCats() {
   sel.value = state.category || '';
 }
 
+// ---------- projects
 /** @type {number | null} */
 let projSel = null, projShut = false, projSeq = 0;
 /** Opens the project `id` in the list, as after making it. @param {number} id */
 export function selectProject(id) { projSel = id; projShut = false; }
+/** Reads the projects again. 'athar:projects' goes out on the window once they are in the store. */
 export async function loadProjects() {
   state.projects = await lib.projects();
   if (!state.projects.some(p => p.id === projSel)) projSel = state.projects[0]?.id ?? null;
   if (state.currentView === 'projects') renderProjectCard().catch(fail);
-  if (host.editor.loaded) { host.editor.infoSig = null; host.editor.updateInfo(); }
+  window.dispatchEvent(new Event('athar:projects'));
 }
 
 // Every project is a row. The picked one carries its actions and opens to show its sounds.
-export async function renderProjectCard() {
+async function renderProjectCard() {
   const seq = ++projSeq, box = $('#projList');
   if (!state.projects.length) {
     box.replaceChildren(el('div', { class: 'empty' }, el('h3', {}, 'No projects yet'), el('p', { class: 'muted' }, 'A project is a folder of its own for what you are making. Create one, then add sounds from the Library: each is copied in, and the original stays where it is.')));
@@ -137,7 +163,6 @@ export async function renderProjectCard() {
   const items = p?.n ? await lib.search({ project: p.id, sort: 'project', limit: 5000 }) : [];
   const pads = padView && p && items.length ? await lib.projectPads(p.id) : {};
   if (seq !== projSeq) return;
-  const count = (/** @type {number} */ n) => `${n} sound${n === 1 ? '' : 's'}`;
   const rename = async (/** @type {Project} */ p) => {
     const v = (await modal(`Rename ${p.name}`, [{ label: 'Name', value: p.name }]))?.[0]?.trim();
     if (!v || v === p.name) return;
@@ -149,18 +174,18 @@ export async function renderProjectCard() {
     ib('ios_share', 'Export: copy the files, or make an SP-404MKII project', stop(() => exportProject(p))),
     ib('grid_view', 'Pads: lay the sounds out on the SP-404MKII pads', stop(() => {
       padView = !padView;
-      try { localStorage.setItem('athar.padView', padView ? '1' : ''); } catch { }
+      remember(PAD_VIEW_KEY, padView ? '1' : '');
       renderProjectCard().catch(fail);
     }), padView ? 'on' : ''),
-    ib('dynamic_feed', 'Batch: prep or convert every sound in this project', stop(() => host.batch(items))),
+    ib('dynamic_feed', 'Batch: prep or convert every sound in this project', stop(() => batch(items))),
     ib('edit', 'Rename project', stop(() => rename(p))),
-    ib('queue_music', 'Show its sounds in the Library', stop(() => { state.project = p.id; host.showView('sounds'); host.search(); })),
+    ib('queue_music', 'Show its sounds in the Library', stop(() => { state.project = p.id; showView('sounds'); search(); })),
     p.folder ? ib('folder_open', 'Show in Finder', stop(() => revealFolder(/** @type {string} */ (p.folder)))) : null,
     ib('close', 'Remove from Athar. The files stay on disk', stop(async () => {
       if (!await confirmModal(`Remove ${p.name}?`, 'The project leaves Athar. Its folder and files stay on disk.', 'Remove')) return;
       try { await lib.deleteProject(p.id); }
       catch (e) { return fail(e); }
-      if (state.project === p.id) { state.project = null; host.search(); }
+      if (state.project === p.id) { state.project = null; search(); }
       loadProjects().catch(fail);
     })),
   ];
@@ -169,7 +194,7 @@ export async function renderProjectCard() {
     const on = !projShut && x.id === projSel, pick = () => { projShut = on; projSel = x.id; renderProjectCard().catch(fail); };
     out.push(focusable(el('div', { class: 'item' + (on ? ' on' : ''), onclick: pick },
       el('span', { class: 'label' }, x.name),
-      el('span', { class: 'count' }, [count(on ? items.length : x.n || 0), diskSize(x.bytes)].filter(Boolean).join(', ')),
+      el('span', { class: 'count' }, [plural(on ? items.length : x.n || 0, 'sound'), diskSize(x.bytes)].filter(Boolean).join(', ')),
       on && p ? actions(p) : null), pick));
     if (!on || !p) continue;
     if (padView && items.length) { out.push(padsArea(p, items, pads)); continue; }
@@ -186,8 +211,8 @@ export async function chooseProjectFolder(p) {
   try { await lib.projectFolder(p.id, { path: dir }); }
   catch (e) { fail(e); return false; }
   notice(`Sounds added to ${p.name} are now copied into its folder`);
-  host.refreshSide(); host.search();
-  setTimeout(() => loadProjects().catch(() => { }), 2500);
+  refreshSide(); search();
+  refreshSideSoon();
   return true;
 }
 
@@ -197,16 +222,16 @@ let dragPath = null;
 /** @type {number | null} */
 let dragPad = null;
 /** @param {Project} p @param {Item[]} items @param {string} from @param {string} to @param {boolean} after */
-export async function moveInProject(p, items, from, to, after) {
+async function moveInProject(p, items, from, to, after) {
   const paths = items.map(x => x.path).filter(x => x !== from);
   paths.splice(paths.indexOf(to) + (after ? 1 : 0), 0, from);
   try { await lib.setProjectOrder(p.id, { paths }); } catch (e) { return fail(e); }
   renderProjectCard().catch(fail);
 }
 /** @param {Project} p @param {Item} it @param {Item[]} [items] */
-export function projectRow(p, it, items = []) {
+function projectRow(p, it, items = []) {
   const over = (/** @type {DragEvent} */ e) => { const r = /** @type {HTMLElement} */ (e.currentTarget).getBoundingClientRect(); return e.clientY > r.top + r.height / 2; };
-  return focusable(el('div', { class: 'prow', draggable: 'true', ondblclick: () => host.openPath(it), 'data-tip': 'Double-click to edit. Drag to reorder.',
+  return focusable(el('div', { class: 'prow', draggable: 'true', ondblclick: () => openPath(it), 'data-tip': 'Double-click to edit. Drag to reorder.',
     ondragstart: (/** @type {DragEvent} */ e) => { dragPath = it.path; e.dataTransfer?.setData('text/plain', it.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'; },
     ondragend: () => { dragPath = null; document.querySelectorAll('.prow.drop-before, .prow.drop-after').forEach(n => n.classList.remove('drop-before', 'drop-after')); },
     ondragover: (/** @type {DragEvent} */ e) => {
@@ -215,8 +240,8 @@ export function projectRow(p, it, items = []) {
     },
     ondragleave: (/** @type {DragEvent} */ e) => /** @type {HTMLElement} */ (e.currentTarget).classList.remove('drop-before', 'drop-after'),
     ondrop: (/** @type {DragEvent} */ e) => { if (!dragPath || dragPath === it.path || dragPad != null) return; e.preventDefault(); e.stopPropagation(); const from = dragPath; dragPath = null; moveInProject(p, items, from, it.path, over(e)); } },
-    Object.assign(ib(host.isPlaying(it) ? 'stop' : 'play_arrow', host.isPlaying(it) ? 'Stop' : 'Play', (e) => { e.stopPropagation(); host.togglePreview(it); }, 'pplay'), { playPath: it.path }),
-    host.miniWave(it),
+    previewButton(it),
+    miniWave(it),
     el('span', { class: 'qn' }, it.name),
     el('span', { class: 'qd' }, [it.category, fmtTime(it.duration)].filter(Boolean).join(' · ')),
     ib('close', 'Remove from project', async (e) => {
@@ -224,18 +249,18 @@ export function projectRow(p, it, items = []) {
       try { await lib.projectItem(p.id, { path: it.path, remove: true }); }
       catch (err) { return fail(err); }
       loadProjects().catch(fail);
-    })), () => host.openPath(it));
+    })), () => openPath(it));
 }
 
 // The SP-404MKII has ten banks of sixteen pads. Pad n is bank n / 16, pad n % 16, and a
 // bank's pads read like text: 1 to 4 across the top row, 13 to 16 across the bottom.
-export const BANKS = 'ABCDEFGHIJ', PADS = 160;
-let padView = false, padBank = 0;
-try { padView = localStorage.getItem('athar.padView') === '1'; } catch { }
-export const padName = (/** @type {number} */ n) => `${BANKS[Math.floor(n / 16)]}${n % 16 + 1}`;
+const BANKS = 'ABCDEFGHIJ', PADS = 160;
+const PAD_VIEW_KEY = 'athar.padView';
+let padView = recall(PAD_VIEW_KEY) === '1', padBank = 0;
+const padName = (/** @type {number} */ n) => `${BANKS[Math.floor(n / 16)]}${n % 16 + 1}`;
 
 /** @param {Project} p @param {Item[]} items @param {Record<string, number>} pads */
-export function padsArea(p, items, pads) {
+function padsArea(p, items, pads) {
   const byPath = new Map(items.map(it => [it.path, it]));
   pads = Object.fromEntries(Object.entries(pads).filter(([path]) => byPath.has(path)));
   const byPad = new Map(Object.entries(pads).map(([path, n]) => /** @type {[number, Item]} */ ([n, byPath.get(path)])));
@@ -258,7 +283,7 @@ export function padsArea(p, items, pads) {
       if (n >= PADS) { left++; continue; }
       next[it.path] = n; taken.add(n);
     }
-    if (left) notice(`${left} sound${left === 1 ? '' : 's'} did not fit: the pads from ${BANKS[padBank]}1 to J16 are full`);
+    if (left) notice(`${plural(left, 'sound')} did not fit: the pads from ${BANKS[padBank]}1 to J16 are full`);
     save(next);
   };
   const clear = (/** @type {string} */ path) => { const next = { ...pads }; delete next[path]; save(next); };
@@ -266,9 +291,9 @@ export function padsArea(p, items, pads) {
   const cell = (/** @type {number} */ n) => {
     const it = byPad.get(n);
     const c = el('div', {
-      class: 'pad' + (it ? '' : ' empty') + (host.isPlaying(it) ? ' playing' : ''), draggable: it ? 'true' : 'false',
-      onclick: () => { if (it) host.togglePreview(it); },
-      ondblclick: () => { if (it) host.openPath(it); },
+      class: 'pad' + (it ? '' : ' empty') + (isPlaying(it) ? ' playing' : ''), draggable: it ? 'true' : 'false',
+      onclick: () => { if (it) togglePreview(it); },
+      ondblclick: () => { if (it) openPath(it); },
       ondragstart: (/** @type {DragEvent} */ e) => { if (!it) return void e.preventDefault(); const t = it; dragPath = t.path; dragPad = n; e.dataTransfer?.setData('text/plain', t.name); if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'; },
       ondragend: endDrag,
       ondragover: (/** @type {DragEvent} */ e) => { if (!dragPath) return; e.preventDefault(); /** @type {HTMLElement} */ (e.currentTarget).classList.add('over'); },
@@ -276,14 +301,14 @@ export function padsArea(p, items, pads) {
       ondrop: (/** @type {DragEvent} */ e) => { if (!dragPath) return; e.preventDefault(); e.stopPropagation(); const path = dragPath; endDrag(); place(path, n); },
     },
       el('span', { class: 'pn' }, padName(n)),
-      it ? el('span', { class: 'qn' }, it.name.replace(/\.[^.]+$/, '')) : null,
-      it ? host.miniWave(it) : null,
+      it ? el('span', { class: 'qn' }, stemOf(it.name)) : null,
+      it ? miniWave(it) : null,
       it ? ib('close', 'Clear pad', (e) => { e.stopPropagation(); clear(it.path); }, 'padx') : null);
     if (it) {
       c.padPath = it.path;
       c.addEventListener('keydown', (e) => { if (e.target === c && (e.key === 'Delete' || e.key === 'Backspace')) { e.preventDefault(); clear(it.path); } });
     }
-    return focusable(c, () => it && host.togglePreview(it));
+    return focusable(c, () => it && togglePreview(it));
   };
   const used = new Set([...byPad.keys()].map(n => Math.floor(n / 16)));
   // Five buttons like the sampler's: each holds a bank pair, and pressing the lit one again
@@ -312,7 +337,7 @@ export function padsArea(p, items, pads) {
       if (!e.dataTransfer?.setDragImage) return;
       const w = /** @type {HTMLElement | null} */ (grid.querySelector('.pad'))?.offsetWidth || 180;
       const ghost = el('div', { class: 'pad padghost', style: `width:${w}px` },
-        el('span', { class: 'pn' }, '\u00a0'), el('span', { class: 'qn' }, it.name.replace(/\.[^.]+$/, '')), host.miniWave(it));
+        el('span', { class: 'pn' }, '\u00a0'), el('span', { class: 'qn' }, stemOf(it.name)), miniWave(it));
       document.body.append(ghost);
       e.dataTransfer.setDragImage(ghost, w / 2, 42);
       setTimeout(() => ghost.remove(), 0);
@@ -325,10 +350,10 @@ export function padsArea(p, items, pads) {
 }
 
 /** @param {Project} p */
-export async function exportProject(p) {
+async function exportProject(p) {
   const v = await modal(`Export ${p.name}`, [
     { label: 'Format', options: [['copy', 'Copy original files'], ['sp404', 'SP-404MKII project']] },
-    { label: 'Name pattern: {project} {category} {n:03d} {name}', value: SETTINGS.name_pattern || '{project}_{name}', when: (f) => f !== 'sp404' },
+    { label: 'File names. Use {project}, {category}, {name} and {n:03d} for a three-digit counter', value: SETTINGS.name_pattern || '{project}_{name}', when: (f) => f !== 'sp404' },
   ]);
   if (!v) return;
   const card = v[0] === 'sp404' ? await lib.sp404Card().catch(() => ({})) : {};
@@ -336,6 +361,6 @@ export async function exportProject(p) {
   if (!dest) return;
   try {
     const r = await lib.exportProject(p.id, { dest, pattern: v[1], format: v[0] });
-    if (v[0] === 'sp404') notice(`Saved ${r.folder.split('/').pop()}`);
+    if (v[0] === 'sp404') notice(`Saved ${baseOf(r.folder)}`);
   } catch (e) { fail(e); }
 }

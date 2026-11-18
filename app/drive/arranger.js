@@ -1,3 +1,5 @@
+// The Arranger: two lanes play and loop, a muted lane goes quiet, and the mix is saved into the
+// first Library folder. Needs a library with sounds named kick_44k* and tone_440*.
 const { lib } = await import('/static/native.js');
 const E = await import('/static/engine.js');
 const lvl = async () => +(await E.invoke('audio_poll')).level.toFixed(3);
@@ -5,10 +7,10 @@ await E.setVolume(0.05);
 const files = await lib.search({ sort: 'name', limit: 500 });
 const by = (n) => files.find(f => f.name.startsWith(n));
 const kick = by('kick_44k'), tone = by('tone_440');
-await lib.setArrangement({ loop: true, lanes: [
+await E.invoke('arr_set', { store: true, a: { loop: true, lanes: [
   { name: 'Kick', gain: 0, clips: [0, 0.5, 1, 1.5].map(at => ({ path: kick.path, duration: kick.duration, sr: kick.sr, at, in: 0, out: 0 })) },
   { name: 'Tone', gain: -6, clips: [{ path: tone.path, duration: tone.duration, sr: tone.sr, at: 0, in: 0.2, out: 0.5 }] },
-] });
+] } });
 document.querySelector('.ab[data-view="arranger"]').click(); await wait(2500);
 const ar = window.athar.arranger;
 log({ lanes: ar.a.lanes.length, length_s: ar.length(), loaded: [...ar.sounds.values()].filter(s => s.info).length });

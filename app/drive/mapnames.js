@@ -1,3 +1,4 @@
+// The Map: the group names the native side gives at each zoom step.
 const E = await import('/static/engine.js');
 document.querySelector('.ab[data-view="map"]').click(); await wait(3000);
 const out = [];

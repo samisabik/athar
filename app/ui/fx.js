@@ -1,32 +1,47 @@
-import { db, NR_N, noteAt } from './units.js';
-import { TOOLS } from './tools.js';
-import { invoke, rate, listen } from './engine.js';
+// The panel under the editor's waveform: the EQ, the effects, and the tools that take values.
+// It holds their settings, shows and plays their result before it is applied, and applies it.
+
+import { db, NR_N, NOTE_NAMES, noteAt, midiName, midiHz, hzMidi, hzLabel } from './units.js';
+import { TOOLS, toolSpec } from './tools.js';
+import { rate, listen } from './engine.js';
+import { doc, effects } from './native.js';
+import { fitCanvas, palette, monoFont } from './canvas.js';
 
 /** @typedef {import('./editor.js').Editor} Editor */
-/** @typedef {{ f: string, label: string, unit: string, min: number, max: number, step: number }} ToolField */
-/** @typedef {{ title: string, fields: ToolField[], audible?: boolean, presets?: [string, number][] }} ToolSpec */
+/** @typedef {import('./tools.js').ToolSpec} ToolSpec */
 /** @typedef {{ type: string, f: number, g: number, q: number, on: boolean }} Band */
 /** @typedef {Record<string, number | boolean>} Params */
 /** @typedef {{ src: string, length: number }} View */
 /** @typedef {HTMLLabelElement & { sync: () => void }} Slider */
 
-/** @param {string | null | undefined} name @returns {ToolSpec} */
-const toolSpec = (name) => /** @type {Record<string, ToolSpec>} */ (/** @type {unknown} */ (TOOLS))[/** @type {string} */ (name)];
+/** @typedef {Error} Failure What a native command rejects with. */
 
-/** @type {Record<string, { node: string, label: string, gain: boolean }>} */
+// The EQ's band types, by the name the native side knows them by. `gain` says whether the band
+// has a gain of its own; a cut or a notch only has a frequency and a width.
+/** @type {Record<string, { label: string, gain: boolean }>} */
 const BAND_TYPES = {
-  bell: { node: 'peaking', label: 'Bell', gain: true },
-  lowshelf: { node: 'lowshelf', label: 'Low shelf', gain: true },
-  highshelf: { node: 'highshelf', label: 'High shelf', gain: true },
-  lowcut: { node: 'highpass', label: 'Low cut', gain: false },
-  highcut: { node: 'lowpass', label: 'High cut', gain: false },
-  notch: { node: 'notch', label: 'Notch', gain: false },
+  bell: { label: 'Bell', gain: true },
+  lowshelf: { label: 'Low shelf', gain: true },
+  highshelf: { label: 'High shelf', gain: true },
+  lowcut: { label: 'Low cut', gain: false },
+  highcut: { label: 'High cut', gain: false },
+  notch: { label: 'Notch', gain: false },
 };
 
 // ---------------------------------------------------------------- panel
 
+// The frequency axis of the panel's graphs, and the EQ's gain range in dB either way.
 const FMIN = 20, FMAX = 20000, DBR = 24;
-const css = (/** @type {string} */ n) => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+/** Where a frequency sits on a log axis W wide. @param {number} hz @param {number} W */
+const freqX = (hz, W) => Math.log(hz / FMIN) / Math.log(FMAX / FMIN) * W;
+/** @param {number} x @param {number} W */
+const xFreq = (x, W) => FMIN * Math.pow(FMAX / FMIN, x / W);
+/** Where a gain in dB sits on the EQ graph, H high. @param {number} g @param {number} H */
+const gainY = (g, H) => H / 2 - g / DBR * (H / 2 - 14);
+/** @param {number} y @param {number} H */
+const yGain = (y, H) => (H / 2 - y) / (H / 2 - 14) * DBR;
+/** @param {number} g */
+const clampGain = (g) => Math.max(-DBR, Math.min(DBR, g));
 const BAND_COLORS = ['--c1', '--c3', '--c2', '--c5', '--c4'];
 
 /**
@@ -66,15 +81,21 @@ function slider(label, key, min, max, step, unit, obj, onInput) {
 const PREVIEW_SECS = 30;
 /** @type {Record<string, string>} */
 const TITLES = { eq: 'Parametric EQ', comp: 'Compressor', max: 'Maximizer', sat: 'Saturation', shape: 'Shape', lofi: 'Lo-fi', nr: 'Noise reduction' };
+// The same names as they read in a question ("Apply EQ?").
 /** @type {Record<string, string>} */
-const LABELS = { eq: 'EQ', comp: 'Compressor', max: 'Maximizer', sat: 'Saturation', shape: 'Shape', lofi: 'Lo-fi', nr: 'Noise reduction' };
+const LABELS = { ...TITLES, eq: 'EQ' };
+// How long a control rests before its result is played.
 const LISTEN_WAIT_MS = 220;
+// Above this length the waveform no longer shows an effect's result; a preview of the first
+// PREVIEW_SECS is processed for listening instead.
+const LONG_S = 60;
 // Tools whose result is as long as the original: the waveform and Play show their result while open.
 /** @type {Set<string | null>} */
 const SAME_LENGTH = new Set(['fade', 'gain', 'normalize', 'loudnorm', 'declick']);
 // Tools whose result is longer or shorter: the waveform shows the result, and Play auditions it.
 /** @type {Set<string | null>} */
 const RESIZING = new Set(['speed', 'tune', 'stretch', 'loopxfade']);
+// Tools that take long enough to work out that their preview waits for the control to be let go.
 /** @type {Set<string | null>} */
 const SLOW = new Set(['declick', 'stretch']);
 const DEFAULTS = {
@@ -89,59 +110,113 @@ const DEFAULTS = {
 export class FxPanel {
   /**
    * @param {HTMLElement} root @param {Editor} editor
-   * @param {(msg: string) => void} toast @param {(msg: string) => void} [notice]
+   * @param {(msg: string) => void} toast @param {(msg: string) => void} notice
    */
   constructor(root, editor, toast, notice) {
-    this.root = root; this.ed = editor; this.toast = toast; this.notice = notice || toast;
-    /** @type {string | null} */
+    this.root = root; this.ed = editor; this.toast = toast; this.notice = notice;
+    /** Asks which of two ways to go: resolves 'ok', 'alt' or something else for neither. @type {((title: string, text: string, ok: string, alt: string) => Promise<string | null>) | null} */
+    this.choose = null;
+    /** Told which section is open, for the cat's lessons. @type {((name: string | null) => void) | null} */
+    this.onSection = null;
+
+    // ---- the open section
+    /** An effect's name, 'tool', or null while the panel is closed. @type {string | null} */
     this.tab = null;
+    /** The open tool, while the section is 'tool'. @type {string | null} */
+    this.toolName = null;
+    /** On Original: the untouched sound is shown and heard. */
     this.bypass = false;
+    /** A control was moved, and its change is neither applied nor discarded yet. */
+    this.touched = false;
+    /** The question about a pending change is on screen. */
+    this.asking = false;
+    /** Apply is running. */
+    this.busy = false;
+    /** A control of the panel is held down. */
+    this.dragging = false;
+    /** Ends everything the open section's controls set going; replaced on every build. */
+    this.buildAbort = new AbortController();
+
+    // ---- effect settings
     /** @type {Band[]} */
     this.bands = [];
     this.selBand = -1;
     this.comp = { ...DEFAULTS.comp }; this.max = { ...DEFAULTS.max }; this.nr = { ...DEFAULTS.nr };
     this.sat = { ...DEFAULTS.sat }; this.shape = { ...DEFAULTS.shape }; this.lofi = { ...DEFAULTS.lofi };
-    /** Asks which of two ways to go: resolves 'ok', 'alt' or something else for neither. @type {((title: string, text: string, ok: string, alt: string) => Promise<string | null>) | null} */
-    this.choose = null;
-    /** The transfer curve last drawn, and the one asked for. @type {{ key: string, out: number[] } | null} */
+    /** The captured noise print, and a count that changes with every capture. @type {{ len: number } | null} */
+    this.noise = null; this.noiseId = 0;
+
+    // ---- tool state
+    /** The open tool's values as it opened, for Reset. @type {string[]} */
+    this.startValues = [];
+    /** Which of the open tool's rulers moved last; the Fade audition plays that end. */
+    this.lastField = 0;
+    /** The sound and range the open tool's controls were built for (see Editor.rangeKey). @type {string | null} */
+    this.toolRangeKey = null;
+    /** Rebuilds Tune once the selection rests. @type {ReturnType<typeof setTimeout> | undefined} */
+    this.tuneTimer = undefined;
+    /** Tune is setting its own first value, which is not a change made by hand. */
+    this.settingUp = false;
+    /** The snapping Tune was last set to. @type {{ scale: string, key: number } | null} */
+    this.tuneScale = null;
+    /** Rewrites the open tool's line of text. @type {(() => void) | null} */
+    this.toolHint = null;
+    /** Brings the open tool's rulers in step with values the editor changed itself. @type {(() => void) | null} */
+    this.toolSync = null;
+
+    // ---- playing the result once a control rests
+    /** A result is waiting to be played. */
+    this.wantPlay = false;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    this.kickTimer = undefined;
+    /** The timer above has yet to fire. */
+    this.kickDue = false;
+
+    // ---- the result shown on the waveform, worked out in the background
+    /** The latest result: the view key it was made for, the sound, and the tool it belongs to. @type {{ key: string, out: View, name: string | null } | null} */
+    this.view = null;
+    /** The view key being worked out, or that failed. @type {string | null} */
+    this.viewPending = null;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    this.viewTimer = undefined;
+    /** A result is being worked out natively; the next one waits. */
+    this.viewBusy = false;
+    /** The view key just applied: the sound itself already shows it. @type {string | null} */
+    this.quietKey = null;
+
+    // ---- the preview of a long sound, for listening
+    /** @type {{ a: number, b: number, v: number, key: string, src: string } | null} */
+    this.pv = null;
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    this.pvTimer = undefined;
+    /** The file the "preview covers the first seconds" message was last shown for. @type {number | undefined} */
+    this.toldShort = undefined;
+
+    // ---- graphs
+    /** @type {HTMLCanvasElement | null} */
+    this.eqCanvas = null;
+    /** The selected band's controls. @type {HTMLElement | null} */
+    this.bandBox = null;
+    /** The graph beside an effect's rulers. @type {HTMLCanvasElement | null} */
+    this.sideCanvas = null;
+    /** The EQ curves last received, and the key of those asked for. @type {{ key: string, data: number[][] } | null} */
+    this.curves = null;
+    /** @type {string | null} */
+    this.curvesWant = null;
+    /** The transfer curve last received, and the key of the one asked for. @type {{ key: string, out: number[] } | null} */
     this.sideCurve = null;
     /** @type {string | null} */
     this.sideWant = null;
-    /** Told which section is open, for the cat's lessons. @type {((name: string | null) => void) | null} */
-    this.onSection = null;
-    /** @type {{ scale: string, key: number } | null} */
-    this.tuneScale = null;
-    this.touched = false; this.wantPlay = false;
-    /** @type {string | null} */
-    this.toolName = null;
-    /** @type {{ len: number } | null} */
-    this.noise = null; this.noiseId = 0;
-    // The spectrum of what plays, sent while the EQ is open and smoothed the way an AnalyserNode is.
+    /** The noise profile drawn in Noise reduction; null inside until it arrives. @type {{ key: string, profile: number[] | null } | null} */
+    this.autoProf = null;
+    // The spectrum of what plays, in dB per bin, sent while the EQ is open. Each report moves
+    // the picture a fifth of the way to the new values, so it does not flicker.
     this.spectrum = new Float32Array(2048).fill(-120);
-    listen('spectrum', (d) => {
+    listen('spectrum', (/** @type {number[]} */ d) => {
       const out = this.spectrum;
       for (let i = 0; i < d.length && i < out.length; i++) out[i] = 0.8 * out[i] + 0.2 * d[i];
-      if (this.tab === 'eq' && this.ed.playing) this.drawEq();
     });
-    /** @type {{ key: string, data: number[][] } | null} */
-    this.curves = null;
-    this.dragging = false;
-    /** @type {AbortController} */
-    this.buildAbort;
-    /** @type {string[]} */
-    this.startValues;
-    /** @type {{ key: string, out: View, name: string | null } | null | undefined} */
-    this.view;
-    /** @type {string | null | undefined} */
-    this.viewPending;
-    /** @type {{ a: number, b: number, v: number, key: string, src: string } | null | undefined} */
-    this.pv;
-    /** @type {{ key: string, profile: number[] | null } | null | undefined} */
-    this.autoProf;
-    /** @type {string | undefined} */
-    this.curvesWant;
-    /** @type {number | undefined} */
-    this.toldShort;
+
     this.body = /** @type {HTMLElement} */ (root.querySelector('.fx-body'));
     this.applyBtn = /** @type {HTMLButtonElement} */ (root.querySelector('[data-x=apply]'));
     /** @type {Element} */ (root.querySelector('.fx-tabs')).addEventListener('click', (e) => {
@@ -166,20 +241,24 @@ export class FxPanel {
     this.dressAb();
   }
 
+  // An effect that is worked out before it is heard; the EQ runs live, and tools go their own way.
   get offline() { return this.tab && this.tab !== 'eq' && this.tab !== 'tool'; }
+  /** The open tool's description; only asked while a tool is open. @returns {ToolSpec} */
+  get spec() { return /** @type {ToolSpec} */ (toolSpec(this.toolName)); }
+  /** The open tool's values as text, in the order of its fields. */
+  toolValues() { return this.spec.fields.map(f => this.ed.field(f.f).value); }
   /** @param {string | null} tab @returns {Params} */
   params(tab) { return /** @type {Record<string, Params>} */ ({ comp: this.comp, max: this.max, nr: this.nr, sat: this.sat, shape: this.shape, lofi: this.lofi })[/** @type {string} */ (tab)]; }
 
   // Every section, effect or tool, has the same frame: its name, the Original / Edited switch,
-  // and Apply and Discard under the controls. The menu item of whatever is
-  // open is marked.
+  // and Apply and Discard under the controls. The menu item of whatever is open is marked.
   dress() {
     const tool = this.tab === 'tool', q = (/** @type {string} */ s) => /** @type {Element} */ (this.root.querySelector(s));
     q('.fx-tabs').hidden = tool;
     this.toolTabs.hidden = !tool;
     if (tool) this.dressToolTabs();
-    q('[data-x=ab]').hidden = tool && !toolSpec(this.toolName)?.audible;
-    q('.fx-title').textContent = tool ? toolSpec(this.toolName).title : (TITLES[/** @type {string} */ (this.tab)] || '');
+    q('[data-x=ab]').hidden = tool && !this.spec.audible;
+    q('.fx-title').textContent = tool ? this.spec.title : (TITLES[/** @type {string} */ (this.tab)] || '');
     this.dressAb(); this.dressBar();
     this.onSection?.(this.section());
     this.root.querySelectorAll('[data-fx]').forEach(b => b.classList.toggle('on', b.dataset.fx === this.tab));
@@ -203,10 +282,10 @@ export class FxPanel {
     }));
   }
 
-  label() { return this.tab === 'tool' ? toolSpec(this.toolName).title : LABELS[/** @type {string} */ (this.tab)]; }
+  label() { return this.tab === 'tool' ? this.spec.title : LABELS[/** @type {string} */ (this.tab)]; }
   // The name of the open section, for the cat's lessons.
   section() { return this.root.hidden ? null : this.tab === 'tool' ? this.toolName : this.tab; }
-  long() { return this.ed.length > this.ed.sr * 60; }
+  long() { return this.ed.length > this.ed.sr * LONG_S; }
 
   dressAb() {
     this.root.querySelectorAll('[data-ab]').forEach((b) => {
@@ -242,7 +321,7 @@ export class FxPanel {
     const inPlace = e.playing && e.loop;
     const done = () => { this.wantPlay = false; };
     if (tab === 'tool') {
-      if (!toolSpec(name).audible) return done();
+      if (!this.spec.audible) return done();
       // A tool is heard as a short excerpt around what it changes, unless the loop is on.
       if (!(e.loop && SAME_LENGTH.has(name) && !this.long())) { done(); return void e.audition(/** @type {string} */ (name)); }
     }
@@ -293,9 +372,10 @@ export class FxPanel {
     this.bypass = true;
     this.tab = 'tool'; this.toolName = name; this.root.hidden = false;
     this.watchSpectrum();
-    if (name === 'trimsilence') this.ed.$('[data-f=trimthresh]').value = -96;
-    if (name === 'fade') { this.ed.$('[data-f=fadeinlen]').value = 0; this.ed.$('[data-f=fadeoutlen]').value = 0; this.lastField = 0; }
-    this.startValues = toolSpec(name).fields.map(f => this.ed.$(`[data-f=${f.f}]`).value);
+    // Trim silent ends opens on the level that cuts nothing, and Fade on no fade at all.
+    if (name === 'trimsilence') this.ed.setNum('trimthresh', -96);
+    if (name === 'fade') { this.clearFades(); this.lastField = 0; }
+    this.startValues = this.toolValues();
     this.dress();
     this.build();
     this.opened();
@@ -304,13 +384,15 @@ export class FxPanel {
   // Puts every control of the open section back to where it started.
   reset() {
     const tab = this.tab; if (!tab) return;
-    if (tab === 'eq') { this.bands = []; this.selBand = -1; }
-    else if (tab === 'tool') toolSpec(this.toolName).fields.forEach((f, i) => { this.ed.$(`[data-f=${f.f}]`).value = this.startValues[i]; });
+    if (tab === 'eq') this.clearBands();
+    else if (tab === 'tool') this.spec.fields.forEach((f, i) => { this.ed.field(f.f).value = this.startValues[i]; });
     else Object.assign(this.params(tab), /** @type {Record<string, Params>} */ (DEFAULTS)[tab]);
     this.build();
     this.touch();
     this.ed.draw();
   }
+
+  clearFades() { this.ed.setNum('fadeinlen', 0); this.ed.setNum('fadeoutlen', 0); }
 
   // The parts of the sound the open Fade tool will change, for the editor to draw and to drag.
   toolMark() {
@@ -320,11 +402,15 @@ export class FxPanel {
   // The editor calls this when the selection or cursor moves.
   selectionChanged() {
     if (this.tab !== 'tool') return;
-    const e = this.ed;
+    const moved = this.toolRangeKey !== this.ed.rangeKey();
     // Tune reads the pitch of the range: a new range, or an undo, needs a new reading.
-    if (this.toolName === 'tune' && this.tuneKey && this.tuneKey !== `${e.version}|${e.range().join('|')}`) { clearTimeout(this.tuneTimer); this.tuneTimer = setTimeout(() => { if (this.tab === 'tool' && this.toolName === 'tune') this.build(); }, 250); return; }
+    if (this.toolName === 'tune' && moved) {
+      clearTimeout(this.tuneTimer);
+      this.tuneTimer = setTimeout(() => { if (this.tab === 'tool' && this.toolName === 'tune') this.build(); }, 250);
+      return;
+    }
     // The fade rulers run to the length of the range: another range needs other rulers.
-    if (this.toolName === 'fade' && this.fadeKey !== `${e.version}|${e.range().join('|')}`) return void this.build();
+    if (this.toolName === 'fade' && moved) return void this.build();
     this.toolHint?.();
   }
 
@@ -343,7 +429,7 @@ export class FxPanel {
   }
 
   build() {
-    this.buildAbort?.abort();
+    this.buildAbort.abort();
     this.buildAbort = new AbortController();
     this.body.innerHTML = '';
     this.eqCanvas = this.bandBox = this.sideCanvas = null;
@@ -361,7 +447,7 @@ export class FxPanel {
     if (!await this.canLeave()) return;
     this.clearPreview();
     this.clearView();
-    this.buildAbort?.abort();
+    this.buildAbort.abort();
     clearTimeout(this.kickTimer); this.wantPlay = false;
     this.ed.stopAudition();
     this.tab = null; this.toolName = null; this.root.hidden = true;
@@ -377,15 +463,19 @@ export class FxPanel {
     this.clearPreview();
     this.clearView();
     this.autoProf = null;
-    this.noise = null; invoke('ed_noise', { range: null }).catch(() => { });
+    // The native side forgets its noise print when it opens a sound.
+    this.noise = null;
     this.touched = false; this.wantPlay = false;
     this.bypass = true; this.dressAb();
     // Another sound starts every effect and tool from its initial settings. The tempo is the
     // sound's own, set by the editor as it loads.
-    this.bands = []; this.selBand = -1;
+    this.clearBands();
     for (const k in DEFAULTS) Object.assign(this.params(k), /** @type {Record<string, Params>} */ (DEFAULTS)[k]);
-    for (const t of Object.values(TOOLS)) for (const f of t.fields) if (f.f !== 'bpm') { const inp = this.ed.$(`[data-f=${f.f}]`); inp.value = inp.defaultValue; }
-    if (this.tab === 'tool') this.startValues = toolSpec(this.toolName).fields.map(f => this.ed.$(`[data-f=${f.f}]`).value);
+    for (const t of Object.values(TOOLS)) for (const f of t.fields) {
+      const inp = this.ed.field(f.f);
+      if (f.f !== 'bpm' && inp instanceof HTMLInputElement) inp.value = inp.defaultValue;
+    }
+    if (this.tab === 'tool') this.startValues = this.toolValues();
     if (this.tab) this.build();
     this.dressBar();
   }
@@ -401,13 +491,15 @@ export class FxPanel {
   }
   toggleAb() { if (this.tab && !/** @type {Element} */ (this.root.querySelector('[data-x=ab]')).hidden) this.setBypass(!this.bypass); }
 
-  // Whether what plays goes through the live EQ; the bands are sent before it starts.
-  liveEq() {
-    const on = this.tab === 'eq' && !this.bypass;
-    if (on) this.syncEq();
-    return on;
+  // Whether what plays goes through the live EQ. Its bands are sent when they change, and by
+  // the editor before playback starts.
+  get eqLive() { return this.tab === 'eq' && !this.bypass; }
+  syncEq() { doc.eq(this.bands).catch(() => { }); }
+  // Applied, reset or another sound: the EQ starts again from no bands, live as well.
+  clearBands() {
+    this.bands = []; this.selBand = -1;
+    if (this.eqLive) this.syncEq();
   }
-  syncEq() { invoke('ed_eq', { bands: this.bands }).catch(() => { }); }
 
   previewRange() {
     const e = this.ed, [a, b] = e.range();
@@ -454,7 +546,7 @@ export class FxPanel {
     const e = this.ed, key = `${e.version}|${a}|${b}|${this.noise ? this.noiseId : 'auto'}`;
     if (this.autoProf?.key !== key) {
       this.autoProf = { key, profile: null };
-      invoke('ed_analyse', { p: { kind: 'profile', a, b } }).then((p) => { if (this.autoProf?.key === key) { this.autoProf.profile = p; this.drawSide(); } }).catch(() => { });
+      doc.analyse({ kind: 'profile', a, b }).then((p) => { if (this.autoProf?.key === key) { this.autoProf.profile = p; this.drawSide(); } }).catch(() => { });
     }
     return this.autoProf.profile;
   }
@@ -476,7 +568,7 @@ export class FxPanel {
     if (b > end && restart && this.toldShort !== e.fileId) { this.toldShort = e.fileId; this.toast(`The preview covers the first ${PREVIEW_SECS} seconds. Apply treats all of it.`); }
     const v = e.version, key = this.viewKey();
     let r;
-    try { r = await invoke('ed_view', { key: `pv|${key}`, p: this.fxEdit(a, b), headS: PREVIEW_SECS }); } catch { return; }
+    try { r = await doc.view(`pv|${key}`, this.fxEdit(a, b), PREVIEW_SECS); } catch { return; }
     if (e.version !== v || this.tab !== tab || this.viewKey() !== key) return;
     this.pv = { a, b: a + r.length, v, key, src: `pv|${key}` };
     if (r.info) this.setInfo(r.info);
@@ -498,13 +590,12 @@ export class FxPanel {
       const name = /** @type {string} */ (this.toolName);
       e.stopAudition();
       this.busy = true; this.applyBtn.disabled = true;
-      const before = e.version;
-      try { await e.action(name); } finally { this.busy = false; this.applyBtn.disabled = false; }
+      let applied;
+      try { applied = await e.action(name); } finally { this.busy = false; this.applyBtn.disabled = false; }
+      // A tool that refused, or whose edit failed, leaves the change pending.
+      if (!applied) return;
       // An applied fade is in the sound now: its rulers go back to nothing and the shape leaves the waveform.
-      if (name === 'fade' && e.version !== before && this.tab === 'tool' && this.toolName === name) {
-        e.$('[data-f=fadeinlen]').value = 0; e.$('[data-f=fadeoutlen]').value = 0;
-        this.build();
-      }
+      if (name === 'fade' && this.tab === 'tool' && this.toolName === name) { this.clearFades(); this.build(); }
       this.touched = false;
       // Until a value changes, the waveform and Play show the applied sound itself, not a second pass.
       if (this.tab === 'tool' && this.toolName === name) { this.quietKey = this.viewKey(); e.draw(); }
@@ -519,7 +610,7 @@ export class FxPanel {
       if (e.version !== v || this.tab !== tab) return this.notice('The sound changed, apply again');
       if (!await e.edit(this.fxEdit(a, b))) return;
       this.clearPreview();
-      if (tab === 'eq') { this.bands = []; this.selBand = -1; this.renderBandControls(); this.drawEq(); }
+      if (tab === 'eq') { this.clearBands(); this.renderBandControls(); this.drawEq(); }
       this.quietKey = this.viewKey();
       this.touched = false; this.dressBar();
     } finally {
@@ -530,54 +621,62 @@ export class FxPanel {
   /** @param {string} t */
   setInfo(t) { const i = this.root.querySelector('.fx-info'); if (i) i.textContent = t; }
 
-  // What the editor should draw while an effect or tool is open: the sound with it applied to the range.
-  // Computed in the background after the settings stop changing; until then the editor draws the
-  // last result for this sound, or the original.
-  // Names the preview: the sound's version, the range, and every value that shapes the result.
+  // Names a result: the sound's version, the range, and every value that shapes it.
   viewKey() {
     const e = this.ed, tab = this.tab, name = this.toolName, [a, b] = e.range();
-    const params = tab === 'tool' ? [name, e.sel ? 1 : 0, ...toolSpec(name).fields.map(f => e.$(`[data-f=${f.f}]`).value)]
+    const params = tab === 'tool' ? [name, e.sel ? 1 : 0, ...this.toolValues()]
       : tab === 'eq' ? this.bands.map(x => [x.type, x.f, x.g, x.q, x.on]) : tab === 'nr' ? [this.nr, this.noise ? this.noiseId : 'auto'] : this.params(tab);
     return `${tab}|${e.version}|${a}|${b}|${JSON.stringify(params)}`;
   }
 
+  // What the editor should draw while an effect or tool is open: the sound with it applied to
+  // the range ({ src, length }), or null for the sound itself. A result that is not there yet is
+  // asked for; until it arrives the editor draws the last one for this sound and this tool.
   displayView() {
     const e = this.ed, tab = this.tab;
-    if (!tab || this.bypass || !e.loaded || e.length > e.sr * 60) return null;
+    if (!tab || this.bypass || !e.loaded || this.long()) return null;
     if (tab === 'tool' && !SAME_LENGTH.has(this.toolName) && !RESIZING.has(this.toolName)) return null;
-    const [a, b] = e.range(), v = e.version;
-    const name = this.toolName, key = this.viewKey();
+    const key = this.viewKey();
     if (key === this.quietKey) return null;
     if (this.view?.key === key) return this.view.out;
-    if (this.viewPending !== key) {
-      this.viewPending = key;
-      clearTimeout(this.viewTimer);
-      const run = async () => {
-        if (this.viewPending !== key || e.version !== v || this.tab !== tab) return;
-        // The slow ones wait for the control to be let go; one result is worked out at a time.
-        if (this.viewBusy || (this.dragging && (tab === 'nr' || SLOW.has(name)))) { this.viewTimer = setTimeout(run, this.viewBusy ? 40 : 150); return; }
-        this.viewBusy = true;
-        try {
-          let out;
-          if (tab === 'tool') out = await e.toolFull(/** @type {string} */ (name), `view|${key}`);
-          else {
-            // Only the range is processed, as Apply does; the rest of the sound is shown as it is.
-            const r = await invoke('ed_view', { key: `view|${key}`, p: this.fxEdit(a, b), headS: null });
-            out = { src: `view|${key}`, length: r.length };
-            if (r.info && this.viewPending === key) this.setInfo(r.info);
-          }
-          this.viewBusy = false;
-          if (this.viewPending !== key || e.version !== v || !out) return;
-          this.view = { key, out, name };
-          if (this.wantPlay) { e.draw(); if (!this.kickDue) this.kick(); }
-          else if (e.playing && tab !== 'eq') e.play(true);
-          else e.draw();
-        } catch { } finally { this.viewBusy = false; }
-      };
-      this.viewTimer = setTimeout(run, 60);
-    }
-    // While the new result is on its way, keep showing the last one for this sound and this tool.
-    return this.view?.name === name && this.view.key.startsWith(`${tab}|${v}|`) ? this.view.out : null;
+    this.requestView(key);
+    return this.view?.name === this.toolName && this.view.key.startsWith(`${tab}|${e.version}|`) ? this.view.out : null;
+  }
+
+  // Works out the result named `key` (the current viewKey) in the background, once the values
+  // have rested, then redraws and plays it if a play was waiting. One key is asked for once.
+  /** @param {string} key */
+  requestView(key) {
+    if (this.viewPending === key) return;
+    this.viewPending = key;
+    clearTimeout(this.viewTimer);
+    const e = this.ed, tab = this.tab, name = this.toolName, v = e.version, [a, b] = e.range();
+    const run = async () => {
+      if (this.viewPending !== key || e.version !== v || this.tab !== tab) return;
+      // The slow ones wait for the control to be let go; one result is worked out at a time.
+      if (this.viewBusy || (this.dragging && (tab === 'nr' || SLOW.has(name)))) { this.viewTimer = setTimeout(run, this.viewBusy ? 40 : 150); return; }
+      this.viewBusy = true;
+      try {
+        let out;
+        if (tab === 'tool') out = await e.toolFull(/** @type {string} */ (name), `view|${key}`);
+        else {
+          // Only the range is processed, as Apply does; the rest of the sound is shown as it is.
+          const r = await doc.view(`view|${key}`, this.fxEdit(a, b));
+          out = { src: `view|${key}`, length: r.length };
+          if (r.info && this.viewPending === key) this.setInfo(r.info);
+        }
+        this.viewBusy = false;
+        if (this.viewPending !== key || e.version !== v || !out) return;
+        this.view = { key, out, name };
+        if (this.wantPlay) { e.draw(); if (!this.kickDue) this.kick(); }
+        else if (e.playing && tab !== 'eq') e.play(true);
+        else e.draw();
+      } catch (err) {
+        // These values have no result. They are not tried again, and no play waits for them.
+        if (this.viewPending === key) { this.wantPlay = false; this.notice(/** @type {Failure} */ (err).message); }
+      } finally { this.viewBusy = false; }
+    };
+    this.viewTimer = setTimeout(run, 60);
   }
 
   // ---------------- EQ
@@ -589,52 +688,43 @@ export class FxPanel {
     this.renderBandControls();
     this.drawEq();
     this.observe(this.eqCanvas, () => this.drawEq());
+    // The spectrum moves for as long as the sound plays.
     const { signal } = this.buildAbort;
     const loop = () => { if (signal.aborted) return; if (this.ed.playing) this.drawEq(); requestAnimationFrame(loop); };
     requestAnimationFrame(loop);
   }
 
-  /** @param {number} f @param {number} W */
-  fx(f, W) { return Math.log(f / FMIN) / Math.log(FMAX / FMIN) * W; }
-  /** @param {number} x @param {number} W */
-  xf(x, W) { return FMIN * Math.pow(FMAX / FMIN, x / W); }
-  /** @param {number} g @param {number} H */
-  gy(g, H) { return H / 2 - g / DBR * (H / 2 - 14); }
-  /** @param {number} y @param {number} H */
-  yg(y, H) { return (H / 2 - y) / (H / 2 - 14) * DBR; }
-
+  // Where a band's handle sits on the graph.
   /** @param {Band} b @param {number} W @param {number} H */
   bandXY(b, W, H) {
     const gain = BAND_TYPES[b.type].gain ? b.g : 0;
-    return [this.fx(b.f, W), this.gy(gain, H)];
+    return [freqX(b.f, W), gainY(gain, H)];
   }
 
   drawEq() {
     if (!this.ed.playing) this.ed.draw();
-    const cv = this.eqCanvas; if (!cv) return;
-    const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
-    if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
-    const g = /** @type {CanvasRenderingContext2D} */ (cv.getContext('2d')); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const fit = this.eqCanvas && fitCanvas(this.eqCanvas); if (!fit) return;
+    const { g, W, H } = fit, css = palette();
     g.fillStyle = css('--wave-bg'); g.fillRect(0, 0, W, H);
-    g.font = '10px "Share Tech Mono", "Martian Mono", monospace';
+    g.font = monoFont(10);
     g.strokeStyle = css('--line'); g.fillStyle = css('--muted'); g.lineWidth = 1;
     for (const f of [50, 100, 200, 500, 1000, 2000, 5000, 10000]) {
-      const x = Math.round(this.fx(f, W)) + .5;
+      const x = Math.round(freqX(f, W)) + .5;
       g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke();
-      g.fillText(f >= 1000 ? f / 1000 + 'k' : String(f), x + 3, H - 4);
+      g.fillText(hzLabel(f), x + 3, H - 4);
     }
     for (const d of [-18, -12, -6, 0, 6, 12, 18]) {
-      const y = Math.round(this.gy(d, H)) + .5;
+      const y = Math.round(gainY(d, H)) + .5;
       g.globalAlpha = d === 0 ? 1 : .6;
       g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke();
       g.globalAlpha = 1; g.fillText((d > 0 ? '+' : '') + d, 4, y - 3);
     }
 
-    if (this.ed.playing && this.liveEq()) {
-      const data = this.readSpectrum(), sr = rate;
+    if (this.ed.playing && this.eqLive) {
+      const data = this.spectrum, sr = rate;
       g.beginPath(); g.moveTo(0, H);
       for (let x = 0; x <= W; x += 2) {
-        const k = Math.min(data.length - 1, Math.round(this.xf(x, W) / (sr / 2) * data.length));
+        const k = Math.min(data.length - 1, Math.round(xFreq(x, W) / (sr / 2) * data.length));
         const v = Math.max(0, (data[k] + 100) / 90);
         g.lineTo(x, H - v * H);
       }
@@ -651,13 +741,13 @@ export class FxPanel {
       for (let k = 0; k < N; k++) total[k] += mag[k];
       if (i === this.selBand) {
         g.beginPath();
-        for (let k = 0; k < N; k++) { const y = this.gy(Math.max(-DBR, Math.min(DBR, mag[k])), H); k ? g.lineTo(k * 2, y) : g.moveTo(0, y); }
-        g.lineTo(W, this.gy(0, H)); g.lineTo(0, this.gy(0, H)); g.closePath();
+        for (let k = 0; k < N; k++) { const y = gainY(clampGain(mag[k]), H); k ? g.lineTo(k * 2, y) : g.moveTo(0, y); }
+        g.lineTo(W, gainY(0, H)); g.lineTo(0, gainY(0, H)); g.closePath();
         g.fillStyle = css(BAND_COLORS[i % BAND_COLORS.length]); g.globalAlpha = .45; g.fill(); g.globalAlpha = 1;
       }
     });
     g.beginPath();
-    for (let k = 0; k < N; k++) { const y = this.gy(Math.max(-DBR, Math.min(DBR, total[k])), H); k ? g.lineTo(k * 2, y) : g.moveTo(0, y); }
+    for (let k = 0; k < N; k++) { const y = gainY(clampGain(total[k]), H); k ? g.lineTo(k * 2, y) : g.moveTo(0, y); }
     g.strokeStyle = this.bypass ? css('--muted') : css('--accent'); g.lineWidth = 2; g.stroke(); g.lineWidth = 1;
 
     this.bands.forEach((b, i) => {
@@ -668,7 +758,7 @@ export class FxPanel {
       g.fillStyle = css('--ink'); g.fillText(String(i + 1), x - 3, y + 3.5);
     });
     if (!this.bands.length) {
-      g.fillStyle = css('--muted'); g.font = '13px "Share Tech Mono", "Martian Mono", monospace';
+      g.fillStyle = css('--muted'); g.font = monoFont(13);
       g.fillText('Double-click to add a band. Drag to move, scroll to change width.', 40, 26);
     }
   }
@@ -681,8 +771,8 @@ export class FxPanel {
     if (this.curves?.key === key) return this.curves.data;
     if (this.curvesWant !== key) {
       this.curvesWant = key;
-      const freqs = Array.from({ length: N }, (_, i) => this.xf(i * 2, W));
-      invoke('eq_response', { bands: this.bands, freqs }).then((data) => {
+      const freqs = Array.from({ length: N }, (_, i) => xFreq(i * 2, W));
+      effects.eqResponse(this.bands, freqs).then((data) => {
         if (this.curvesWant !== key) return;
         this.curves = { key, data }; this.drawEq();
       }).catch(() => { });
@@ -690,8 +780,8 @@ export class FxPanel {
     return this.curves?.data?.length === this.bands.length ? this.curves.data : null;
   }
 
-  readSpectrum() { return this.spectrum; }
-  watchSpectrum() { invoke('audio_watch_spectrum', { on: this.tab === 'eq' }).catch(() => { }); }
+  // The engine only sends the spectrum while the EQ is open.
+  watchSpectrum() { effects.watchSpectrum(this.tab === 'eq').catch(() => { }); }
 
   /** @param {number} x @param {number} y */
   hitBand(x, y) {
@@ -712,20 +802,20 @@ export class FxPanel {
     window.addEventListener('mousemove', (e) => {
       if (drag < 0) return;
       const [x, y] = pos(e), W = cv.clientWidth, H = cv.clientHeight, b = this.bands[drag];
-      b.f = Math.max(FMIN, Math.min(FMAX, this.xf(x, W)));
-      if (BAND_TYPES[b.type].gain) b.g = Math.max(-DBR, Math.min(DBR, this.yg(y, H)));
-      this.bandChanged(false);
+      b.f = Math.max(FMIN, Math.min(FMAX, xFreq(x, W)));
+      if (BAND_TYPES[b.type].gain) b.g = clampGain(yGain(y, H));
+      this.bandChanged();
     }, { signal });
     window.addEventListener('mouseup', () => { drag = -1; }, { signal });
     cv.addEventListener('dblclick', (e) => {
       const [x, y] = pos(e), W = cv.clientWidth, H = cv.clientHeight;
       const hit = this.hitBand(x, y);
-      if (hit >= 0) { this.bands.splice(hit, 1); this.selBand = -1; return this.bandChanged(true); }
-      const f = this.xf(x, W);
+      if (hit >= 0) { this.bands.splice(hit, 1); this.selBand = -1; return this.bandChanged(); }
+      const f = xFreq(x, W);
       const type = f < 40 ? 'lowcut' : f > 14000 ? 'highcut' : 'bell';
-      this.bands.push({ type, f, g: type === 'bell' ? Math.max(-DBR, Math.min(DBR, Math.round(this.yg(y, H) * 2) / 2)) : 0, q: type === 'bell' ? 1 : 0.71, on: true });
+      this.bands.push({ type, f, g: type === 'bell' ? clampGain(Math.round(yGain(y, H) * 2) / 2) : 0, q: type === 'bell' ? 1 : 0.71, on: true });
       this.selBand = this.bands.length - 1;
-      this.bandChanged(true);
+      this.bandChanged();
     });
     cv.addEventListener('wheel', (e) => {
       const [x, y] = pos(e), hit = this.hitBand(x, y), i = hit >= 0 ? hit : this.selBand;
@@ -733,14 +823,14 @@ export class FxPanel {
       e.preventDefault();
       const b = this.bands[i];
       b.q = Math.max(0.1, Math.min(18, b.q * Math.exp(-e.deltaY * 0.004)));
-      this.selBand = i; this.bandChanged(false);
+      this.selBand = i; this.bandChanged();
     }, { passive: false });
   }
 
-  /** @param {boolean} structural */
-  bandChanged(structural) {
+  // A band was added, removed or moved: the live EQ, the band's controls and the graph follow.
+  bandChanged() {
     this.touch();
-    if (this.tab === 'eq' && !this.bypass) this.syncEq();
+    if (this.eqLive) this.syncEq();
     this.renderBandControls();
     this.drawEq();
   }
@@ -768,10 +858,10 @@ export class FxPanel {
         if (inp.value === '' || !isFinite(v)) { inp.value = String(b[k]); return; }
         b[k] = Math.max(Number(inp.min), Math.min(Number(inp.max), v));
       }
-      this.bandChanged(k === 'type');
+      this.bandChanged();
     });
-    /** @type {Element} */ (box.querySelector('[data-k=on]')).onclick = () => { b.on = !b.on; this.bandChanged(true); };
-    /** @type {Element} */ (box.querySelector('[data-k=del]')).onclick = () => { this.bands.splice(this.selBand, 1); this.selBand = -1; this.bandChanged(true); };
+    /** @type {Element} */ (box.querySelector('[data-k=on]')).onclick = () => { b.on = !b.on; this.bandChanged(); };
+    /** @type {Element} */ (box.querySelector('[data-k=del]')).onclick = () => { this.bands.splice(this.selBand, 1); this.selBand = -1; this.bandChanged(); };
   }
 
   // ---------------- compressor / maximizer / noise
@@ -826,9 +916,10 @@ export class FxPanel {
 
   // ---------------- tools: the same rulers, bound to the values the editor's actions read
   buildTool() {
-    const name = this.toolName, spec = toolSpec(name), e = this.ed, { signal } = this.buildAbort;
-    const inputs = spec.fields.map(f => e.$(`[data-f=${f.f}]`));
-    if (name === 'fade') for (const inp of inputs) inp.value = Math.min(Number(inp.value) || 0, e.rangeMs());
+    const name = this.toolName, spec = this.spec, e = this.ed, { signal } = this.buildAbort;
+    const inputs = spec.fields.map(f => e.field(f.f));
+    this.toolRangeKey = e.rangeKey();
+    if (name === 'fade') for (const inp of inputs) inp.value = String(Math.min(Number(inp.value) || 0, e.rangeMs()));
     /** @type {(() => void) | null} */
     let hint = null;
     const changed = () => {
@@ -838,21 +929,19 @@ export class FxPanel {
       e.draw();
     };
     const rows = spec.fields.map((f, i) => {
-      /** @type {Params} */
-      const value = {};
-      Object.defineProperty(value, 'v', { get: () => Number(inputs[i].value) || 0, set: (/** @type {number} */ v) => { inputs[i].value = v; } });
+      // The ruler reads and writes the field that the editor's actions read.
+      const value = { get v() { return Number(inputs[i].value) || 0; }, set v(x) { inputs[i].value = String(x); } };
       // A fade can be as long as the sound or the selection, so its ruler runs to exactly that.
       const max = name === 'fade' ? Math.max(1, e.rangeMs()) : f.max;
       return slider(f.label, 'v', f.min, max, f.step, f.unit, value, () => { this.lastField = i; changed(); });
     });
-    const setFirst = (/** @type {number} */ v) => () => { inputs[0].value = v; rows[0].sync(); changed(); };
+    const setFirst = (/** @type {number} */ v) => () => { inputs[0].value = String(v); rows[0].sync(); changed(); };
     const presets = spec.presets ? this.presetRow(spec.presets.map(([label, v]) => [label, setFirst(v)])) : null;
     this.sideLayout([...rows, presets], false);
     this.toolHint = () => hint?.();
     // Called when the editor changes a tool's value itself, as when a fade is dragged on the waveform.
     this.toolSync = () => { rows.forEach(r => r.sync()); changed(); };
     if (name === 'fade') {
-      this.fadeKey = `${e.version}|${e.range().join('|')}`;
       hint = () => {
         const [fin, fout] = e.fadeSpans(), ms = (/** @type {{ a: number, b: number }} */ m) => `${Math.round((m.b - m.a) / e.sr * 1000)} ms`, on = e.sel && e.sel[1] > e.sel[0] ? 'the selection' : 'the sound';
         const parts = [fin.b > fin.a && `fades in over the first ${ms(fin)}`, fout.b > fout.a && `fades out over the last ${ms(fout)}`].filter(Boolean);
@@ -876,19 +965,18 @@ export class FxPanel {
 
   // Reads the pitch of the range, offers the nearest notes, and says where the shift lands.
   /**
-   * @param {HTMLInputElement} input @param {Slider} row @param {() => void} changed @param {AbortSignal} signal
+   * @param {HTMLInputElement | HTMLSelectElement} input @param {Slider} row @param {() => void} changed @param {AbortSignal} signal
    * @param {(fn: () => void) => void} setHint
    */
   async buildTune(input, row, changed, signal, setHint) {
     const e = this.ed, [a, b] = e.range();
-    this.tuneKey = `${e.version}|${a}|${b}`;
     input.value = '0'; row.sync();
     this.setInfo('Listening for the pitch…');
     let hz = null;
-    try { hz = (await invoke('ed_analyse', { p: { kind: 'pitch', a, b } })).hz; } catch { }
+    try { hz = (await doc.analyse({ kind: 'pitch', a, b })).hz; } catch { }
     if (signal.aborted) return;
     if (!hz) return this.setInfo('No clear pitch found here. Shift by ear; the sound gets shorter as it goes up.');
-    const near = noteAt(hz), shiftTo = (/** @type {number} */ midi) => 12 * Math.log2(440 * Math.pow(2, (midi - 69) / 12) / hz);
+    const near = noteAt(hz), shiftTo = (/** @type {number} */ midi) => 12 * Math.log2(midiHz(midi) / hz);
     const describe = () => {
       const s = Number(input.value) || 0, land = noteAt(hz * Math.pow(2, s / 12));
       this.setInfo(`Now ${near.name} ${near.cents >= 0 ? '+' : '−'}${Math.abs(near.cents)} cents (${hz.toFixed(1)} Hz). With this shift: ${land.name} ${land.cents >= 0 ? '+' : '−'}${Math.abs(land.cents)} cents. Length changes with pitch.`);
@@ -896,12 +984,10 @@ export class FxPanel {
     setHint(describe);
     // The ruler steps through notes, so every stop is in tune. A key and scale narrow the stops
     // further; "Free" brings back the plain shift in semitones.
-    const NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
     /** @type {Record<string, [string, number[] | null]>} */
     const SCALES = { all: ['All notes', null], major: ['Major', [0, 2, 4, 5, 7, 9, 11]], minor: ['Minor', [0, 2, 3, 5, 7, 8, 10]],
       majpent: ['Major pentatonic', [0, 2, 4, 7, 9]], minpent: ['Minor pentatonic', [0, 3, 5, 7, 10]], free: ['Free, no snapping', null] };
     const st = this.tuneScale ||= { scale: 'all', key: 0 };
-    const nameOf = (/** @type {number} */ midi) => NAMES[((midi % 12) + 12) % 12] + (Math.floor(midi / 12) - 1);
     const noteRow = document.createElement('label');
     noteRow.className = 'sl';
     noteRow.innerHTML = '<span>Note</span><input type="range" min="0" step="1"><output></output>';
@@ -921,7 +1007,7 @@ export class FxPanel {
     const setNote = (/** @type {number} */ midi, /** @type {boolean} */ announce) => {
       input.value = shiftTo(midi).toFixed(2); row.sync();
       const s = Number(input.value);
-      noteOut.textContent = `${nameOf(midi)}  ${s >= 0 ? '+' : '−'}${Math.abs(s).toFixed(2)} st`;
+      noteOut.textContent = `${midiName(midi)}  ${s >= 0 ? '+' : '−'}${Math.abs(s).toFixed(2)} st`;
       if (announce) changed(); else describe();
     };
     const layout = (/** @type {boolean} */ announce) => {
@@ -931,13 +1017,13 @@ export class FxPanel {
       stops = [];
       for (let m = near.midi - 12; m <= near.midi + 12; m++) if (!steps || steps.includes((((m - st.key) % 12) + 12) % 12)) stops.push(m);
       // Stay on the note the current shift is closest to.
-      const want = 69 + 12 * Math.log2(hz * Math.pow(2, (Number(input.value) || 0) / 12) / 440);
+      const want = hzMidi(hz * Math.pow(2, (Number(input.value) || 0) / 12));
       let at = 0; stops.forEach((m, k) => { if (Math.abs(m - want) < Math.abs(stops[at] - want)) at = k; });
       noteIn.max = String(stops.length - 1); noteIn.value = String(at);
       setNote(stops[at], announce);
     };
     noteIn.oninput = () => setNote(stops[+noteIn.value], true);
-    const keySel = select(NAMES.map((n, k) => [k, n]), st.key, (v) => { st.key = +v; layout(true); }, 'Key');
+    const keySel = select(NOTE_NAMES.map((n, k) => [k, n]), st.key, (v) => { st.key = +v; layout(true); }, 'Key');
     const scaleSel = select(Object.entries(SCALES).map(([k, v]) => [k, v[0]]), st.scale, (v) => { st.scale = v; layout(true); }, 'Scale');
     const scaleRow = document.createElement('div'); scaleRow.className = 'fx-presets fx-scale';
     const lab = (/** @type {string} */ text, /** @type {Node} */ node) => { const l = document.createElement('label'); l.className = 'f'; const sp = document.createElement('span'); sp.textContent = text; l.append(sp, node); return l; };
@@ -976,8 +1062,12 @@ export class FxPanel {
     auto.className = 'ib'; auto.dataset.tip = 'Auto: amplify until the sound reaches about -12 dB RMS, limited at the ceiling';
     auto.innerHTML = '<span class="i">auto_mode</span>';
     auto.onclick = async () => {
-      const [a, b] = this.ed.range();
-      const s = await invoke('ed_analyse', { p: { kind: 'stats', a, b } });
+      const e = this.ed, { signal } = this.buildAbort, key = e.rangeKey(), [a, b] = e.range();
+      let s;
+      try { s = await doc.analyse({ kind: 'stats', a, b }); }
+      catch (err) { return this.notice(/** @type {Failure} */ (err).message); }
+      // The answer is for the sound and range it was asked about, and for this panel.
+      if (signal.aborted || e.rangeKey() !== key) return;
       p.gain = Math.max(0, Math.min(30, Math.round((-12 - s.rms) * 2) / 2));
       gain.sync(); on();
       this.setInfo(`input peak ${s.peak.toFixed(1)} dB, RMS ${s.rms.toFixed(1)} dB, amplify ${p.gain} dB`);
@@ -1004,12 +1094,12 @@ export class FxPanel {
     capBtn.onclick = () => {
       const e = this.ed;
       if (!e.sel || e.sel[1] - e.sel[0] < e.sr * 0.05) return this.notice('Select at least 50 ms of noise only, then capture');
-      invoke('ed_noise', { range: [e.sel[0], e.sel[1]] }).catch(() => { });
+      doc.noise([e.sel[0], e.sel[1]]).catch(() => { });
       this.noise = { len: e.sel[1] - e.sel[0] };
       this.noiseId++;
       showState(); this.toast('Noise print captured. Select what to clean (or nothing for the whole file).'); on();
     };
-    clrBtn.onclick = () => { this.noise = null; invoke('ed_noise', { range: null }).catch(() => { }); showState(); on(); };
+    clrBtn.onclick = () => { this.noise = null; doc.noise(null).catch(() => { }); showState(); on(); };
     showState();
     this.sideLayout([
       cap,
@@ -1020,13 +1110,11 @@ export class FxPanel {
 
   drawSide() {
     const cv = this.sideCanvas; if (!cv || !cv.isConnected) return;
-    const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
-    if (!W || !H) return;
-    if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
-    const g = /** @type {CanvasRenderingContext2D} */ (cv.getContext('2d')); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const fit = fitCanvas(cv); if (!fit) return;
+    const { g, W, H } = fit, css = palette();
     g.fillStyle = css('--wave-bg'); g.fillRect(0, 0, W, H);
     g.strokeStyle = css('--line'); g.lineWidth = 1;
-    g.font = '10px "Share Tech Mono", "Martian Mono", monospace'; g.fillStyle = css('--muted');
+    g.font = monoFont(10); g.fillStyle = css('--muted');
 
     if (this.tab === 'comp' || this.tab === 'max' || this.tab === 'sat') {
       const R = 60, X = (/** @type {number} */ d) => (d + R) / R * W, Y = (/** @type {number} */ d) => H - (d + R) / R * H;
@@ -1044,7 +1132,7 @@ export class FxPanel {
         g.strokeStyle = css('--accent'); g.lineWidth = 2; g.stroke();
       } else if (this.sideWant !== key) {
         this.sideWant = key;
-        invoke('fx_curve', { tab, p: this.params(tab), from: -R, to: 0, n }).then((/** @type {number[]} */ out) => {
+        effects.curve(tab, this.params(tab), -R, 0, n).then((out) => {
           if (this.sideWant !== key) return;
           this.sideCurve = { key, out }; this.drawSide();
         }).catch(() => { });
@@ -1054,9 +1142,9 @@ export class FxPanel {
       const e = this.ed; if (!e.loaded) return;
       const prof = this.profileFor(.../** @type {[number, number]} */ (e.range()));
       if (!prof) return;
-      const bins = prof.length, xOf = (/** @type {number} */ k) => Math.log(Math.max(1, k * e.sr / NR_N) / FMIN) / Math.log(FMAX / FMIN) * W;
+      const bins = prof.length, xOf = (/** @type {number} */ k) => freqX(Math.max(1, k * e.sr / NR_N), W);
       const yOf = (/** @type {number} */ m) => H - Math.max(0, (db(m / (NR_N / 4)) + 110) / 100) * H;
-      for (const f of [100, 1000, 10000]) { const x = Math.log(f / FMIN) / Math.log(FMAX / FMIN) * W; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); g.fillText(f >= 1000 ? f / 1000 + 'k' : String(f), x + 2, H - 3); }
+      for (const f of [100, 1000, 10000]) { const x = freqX(f, W); g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); g.fillText(hzLabel(f), x + 2, H - 3); }
       const path = (/** @type {number} */ scale) => { g.beginPath(); for (let k = 1; k < bins; k++) { const x = xOf(k), y = yOf(prof[k] * scale); k > 1 ? g.lineTo(x, y) : g.moveTo(x, y); } };
       path(this.nr.sensitivity); g.strokeStyle = css('--accent'); g.lineWidth = 2; g.stroke();
       path(1); g.lineTo(W, H); g.lineTo(0, H); g.closePath(); g.fillStyle = css('--c1'); g.globalAlpha = .6; g.fill(); g.globalAlpha = 1;

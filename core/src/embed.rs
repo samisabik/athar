@@ -29,7 +29,7 @@ fn environment() -> Result<&'static Environment, Error> {
 /// Audio clips embedded at once: one model session each, two threads per session. One session
 /// gains little from more threads, so several run side by side; they share their packed weights.
 /// Measured on a 10-core Mac: 3 sessions index as fast as 5, in a third of the memory.
-pub fn default_pool() -> usize {
+fn default_pool() -> usize {
     (std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2) / 2).clamp(1, 3)
 }
 
@@ -52,10 +52,11 @@ impl Clap {
         Self::load_with(dir, default_pool())
     }
 
+    /// `load` with the number of audio sessions given.
     pub fn load_with(dir: &Path, pool: usize) -> Result<Self, Error> {
         let env = environment()?;
-        // CPU only, as in the Python engine. On macOS ort otherwise adds the CoreML provider on
-        // its own, and that fails on the text model.
+        // CPU only. On macOS ort otherwise adds the CoreML provider on its own, and that fails
+        // on the text model.
         let cpu = || -> Result<_, Error> {
             Session::builder(env)?.with_auto_device(AutoDevicePolicy::PreferCPU).map_err(msg)?.with_execution_providers([ep::CPU::default().build()]).map_err(msg)
         };
@@ -96,10 +97,6 @@ impl Clap {
         Ok(normalize(data.to_vec()))
     }
 
-    pub fn pool(&self) -> usize {
-        self.audio.len()
-    }
-
     /// A sound made of several clips is the normalized mean of their vectors.
     pub fn embed_sound(&self, clips: &[Vec<f32>]) -> Result<Vec<f32>, Error> {
         let mut sum: Vec<f32> = Vec::new();
@@ -114,6 +111,7 @@ impl Clap {
         Ok(normalize(sum))
     }
 
+    /// One unit-length vector per text.
     pub fn embed_texts(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, Error> {
         let enc = self.tokenizer.encode_batch(texts.to_vec(), true)?;
         let len = enc.first().map(|e| e.get_ids().len()).unwrap_or(0);

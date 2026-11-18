@@ -1,6 +1,6 @@
 // The cat: it walks along the bottom bar and gives tips for the page you are on.
 
-import { $ } from './ui.js';
+import { $, reduceMotion } from './ui.js';
 import { CAT_SKINS } from './cats.js';
 import { SECTION_LESSONS, PAGE_LESSONS } from './lessons.js';
 
@@ -13,9 +13,10 @@ const pageLessons = /** @type {Record<string, Lesson | undefined>} */ (PAGE_LESS
 
 // Where the user is: the page, and the editor section open on it. Set by main.js.
 export const where = { view: () => 'sounds', section: () => /** @type {string|null} */ (null) };
-// ---------- the cat: tips for the page you are on
+
+// Tips for the page the user is on.
 /** @type {Record<string, string[] | undefined>} */
-export const CAT_TIPS = {
+const CAT_TIPS = {
   sounds: [
     'Describe what you hear, like "rain on a tin roof". File names and tags count too.',
     'J and K move through the list. Space plays the sound.',
@@ -144,29 +145,28 @@ export const CAT_TIPS = {
     'The loudness target here is what "Normalize loudness" starts from in the editor.',
   ],
 };
-export const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 /** @type {{ x: number | null, moving: boolean, facing: number, stop: boolean, mode: string, t0: number }} */
-export const cat = { x: null, moving: false, facing: 1, stop: false, mode: 'idle', t0: 0 };
+const cat = { x: null, moving: false, facing: 1, stop: false, mode: 'idle', t0: 0 };
 /** @type {Record<string, number>} */
-export const catTipIndex = {};
+const catTipIndex = {};
 /** @type {Skin} */
 let skin = CAT_SKINS.sukey;
-export const catImg = new Image();
+const catImg = new Image();
 // The cat lives in the band above the page: from its left edge to the volume ruler.
-export const CAT_MAX_SIZE = 72;
-export const catSize = () => Math.min(skin.size, CAT_MAX_SIZE);
-export const catMin = () => {
+const CAT_MAX_SIZE = 72;
+const catSize = () => Math.min(skin.size, CAT_MAX_SIZE);
+const catMin = () => {
   const h = [...document.querySelectorAll('.vhead')].find(e => e.offsetParent);
   return h ? Math.round(h.getBoundingClientRect().left) + 28 : 90;
 };
 // The speech bubble reaches 86 px to the right of the cat, so the cat stops far enough from the
 // volume tile for the bubble to clear it.
-export const catMax = () => Math.max(catMin(), Math.round($('.transport').getBoundingClientRect().left) - Math.max(catSize() + 12, 86 + 28));
-export const clampCat = (/** @type {number} */ x) => Math.min(Math.max(x, catMin()), catMax());
-export function catPlace() { $('#cat').style.transform = `translateX(${cat.x}px)`; }
+const catMax = () => Math.max(catMin(), Math.round($('.transport').getBoundingClientRect().left) - Math.max(catSize() + 12, 86 + 28));
+const clampCat = (/** @type {number} */ x) => Math.min(Math.max(x, catMin()), catMax());
+function catPlace() { $('#cat').style.transform = `translateX(${cat.x}px)`; }
 
 /** @param {string} text */
-export function catSay(text) {
+function catSay(text) {
   const b = $('#catBubble'), left = (cat.x ?? 999) < 320;
   $('#catText').textContent = text;
   b.style.left = left ? '20px' : '-200px';
@@ -175,7 +175,7 @@ export function catSay(text) {
 }
 // What the cat can say where the user is. With an editor section open it explains that section
 // first, then carries on with the page; on a page, its tips and its short explanations are mixed.
-export function catLines() {
+function catLines() {
   const view = where.view(), tips = CAT_TIPS[view] || /** @type {string[]} */ (CAT_TIPS.sounds), facts = pageLessons[view]?.cards || [];
   const mixed = [];
   for (let t = 0, f = 0; t < tips.length || f < facts.length;) {
@@ -187,7 +187,7 @@ export function catLines() {
 }
 /** @type {string | null} */
 let catKey = null;
-export function catTip() {
+function catTip() {
   const { key, list } = catLines();
   const k = ((catTipIndex[key] ?? -1) + 1) % list.length;
   catTipIndex[key] = k; catKey = key;
@@ -221,7 +221,7 @@ export function setCatSkin(name) {
 }
 // Skins with a dedicated left row draw it as-is; every other skin mirrors all its frames when facing left.
 /** @param {string} name @param {number} i */
-export function catFrame(name, i) {
+function catFrame(name, i) {
   const cv = $('#catCanvas');
   if (!cv || !catImg.complete || !catImg.naturalWidth) return;
   const a = skin.anim[name] || skin.anim.idle;
@@ -233,10 +233,10 @@ export function catFrame(name, i) {
   cv.style.transform = !skin.anim.left && cat.facing < 0 ? 'scaleX(-1)' : '';
 }
 /** @param {string} name */
-export function catShow(name) { cat.mode = name; cat.t0 = performance.now(); catFrame(name, 0); }
+function catShow(name) { cat.mode = name; cat.t0 = performance.now(); catFrame(name, 0); }
 // Play a one-shot animation to its end, then return to idle.
 /** @param {string} name @returns {Promise<void>} */
-export function catOnce(name) {
+function catOnce(name) {
   const a = skin.anim[name];
   if (!a) return Promise.resolve();
   cat.mode = 'once'; cat.t0 = performance.now();
@@ -253,7 +253,7 @@ export function catOnce(name) {
 
 /** @type {number | undefined} */
 let meowTimer;
-export function catMeow() {
+function catMeow() {
   const m = $('#catMeow');
   m.classList.toggle('left', cat.facing < 0);
   m.hidden = false;
@@ -263,7 +263,7 @@ export function catMeow() {
 
 // The cat stays put most of the time: it sits, grooms or meows, then runs across to the other side.
 /** @param {number} to @returns {Promise<void>} */
-export function catMove(to) {
+function catMove(to) {
   return new Promise((done) => {
     const from = /** @type {number} */ (cat.x), ms = Math.abs(to - from) / skin.speed * 1000, t0 = performance.now(), fm = skin.anim.right.ms;
     cat.facing = to < from ? -1 : 1; cat.moving = true; cat.stop = false;
@@ -282,7 +282,7 @@ export function catMove(to) {
     requestAnimationFrame(step);
   });
 }
-export async function catWander() {
+async function catWander() {
   const busy = $('#cat').hidden || !$('#catBubble').hidden || reduceMotion;
   if (!busy) {
     if (Math.random() < .7) {

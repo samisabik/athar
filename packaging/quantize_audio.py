@@ -15,16 +15,25 @@ from pathlib import Path
 from onnxruntime.quantization import QuantType, quantize_dynamic
 
 ROOT = Path(__file__).resolve().parents[1]
+FULL = ROOT / "build" / "model"
 OUT = ROOT / "build" / "model-audio-pc"
-OUT.mkdir(parents=True, exist_ok=True)
-quantize_dynamic(ROOT / "build/model/audio.onnx", OUT / "audio.onnx", weight_type=QuantType.QInt8, per_channel=True)
-print(f"Wrote {OUT / 'audio.onnx'}")
+# The models as the app loads them when run from source: the int8 audio model beside the
+# full-size text model and the tokenizer.
+FROM_SOURCE = ROOT / "build" / "model-next"
 
-# build/model-next: the int8 audio model with the full-size text model, as the Rust app uses them.
-NEXT = ROOT / "build" / "model-next"
-NEXT.mkdir(exist_ok=True)
-for name, src in (("audio.onnx", OUT / "audio.onnx"), ("text.onnx", ROOT / "build/model/text.onnx"), ("tokenizer.json", ROOT / "build/model/tokenizer.json")):
-    link = NEXT / name
-    link.unlink(missing_ok=True)
-    link.symlink_to(src.resolve())
-print(f"Wrote {NEXT}")
+
+def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    quantize_dynamic(FULL / "audio.onnx", OUT / "audio.onnx", weight_type=QuantType.QInt8, per_channel=True)
+    print(f"Wrote {OUT / 'audio.onnx'}")
+
+    FROM_SOURCE.mkdir(exist_ok=True)
+    for name, src in (("audio.onnx", OUT), ("text.onnx", FULL), ("tokenizer.json", FULL)):
+        link = FROM_SOURCE / name
+        link.unlink(missing_ok=True)
+        link.symlink_to((src / name).resolve())
+    print(f"Wrote {FROM_SOURCE}")
+
+
+if __name__ == "__main__":
+    main()

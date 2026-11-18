@@ -28,7 +28,7 @@ pub fn start(app: AppHandle) {
             let ended = engine.take_ended();
             if !ended.is_empty() || clock.elapsed() >= CLOCK {
                 clock = Instant::now();
-                let _ = app.emit("engine", json!({"now": engine.now(), "rate": engine.rate(), "ended": ended}));
+                let _ = app.emit("engine", json!({"now": engine.now(), "rate": engine.rate(), "ended": ended, "error": engine.error()}));
             }
             if let Some(st) = app.state::<Arr>().changed(&mut arr_seen) {
                 let _ = app.emit("arranger", st);

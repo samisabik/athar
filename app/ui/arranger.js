@@ -1,9 +1,19 @@
+import { el, ib, icon, notice, toast, fail, modal, confirmModal, focusable, remember, recall } from './ui.js';
 import { lib } from './native.js';
 import { fmtTime } from './time.js';
 import { invoke, now, listen } from './engine.js';
-import { MAX_LANES, MAX_HITS, MAX_SECONDS, MIN_GAIN_DB, MAX_GAIN_DB } from './arrange.js';
+import { SETTINGS } from './settings.js';
+import { baseOf, stemOf, plural } from './names.js';
+import { askSavePlace } from './places.js';
+import { registerPlayer, stopOthers } from './players.js';
+import { openPath } from './editing.js';
+import { refreshSide, refreshSideSoon } from './sidebar.js';
 import { ArrBrowser } from './arrbrowser.js';
 
+// The Arranger's limits. The native side holds the same ones and cuts a stored arrangement down
+// to them (ARRANGE_MAX_* and the gain bounds in app/src/library/arrangement.rs).
+const MAX_LANES = 16, MAX_CLIPS = 64, MAX_SECONDS = 10 * 60;
+const MIN_GAIN_DB = -24, MAX_GAIN_DB = 6;
 // Sizes the stylesheet shares: the lane heads' width and a lane's height (style.css, "arranger").
 const HEAD_W = 168, LANE_H = 76;
 const DOUBLE_CLICK_MS = 400, MAGNET_PX = 9, WAVE_H = 24, MAX_ZOOM = 32, NUDGE = 0.01;
@@ -18,8 +28,8 @@ const TICKS = [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
 
 /** @returns {Arrangement} */
 const empty = () => ({ loop: true, lanes: [] });
-const stem = (/** @type {string} */ name) => name.replace(/\.[^.]+$/, '');
-const plural = (/** @type {number} */ n, /** @type {string} */ word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+// Whether the browser was left open or folded away.
+const BROWSER_KEY = 'athar.arranger.browser';
 // The same curve as an outline, for the part of a clip a fade takes away: the area above the
 // level line, from silence at the clip's edge up to full level where the fade ends.
 const curve = (/** @type {boolean} */ flip) => Array.from({ length: 17 }, (_, i) => { const x = 1 - i / 16; return `${((flip ? 1 - x : x) * 100).toFixed(1)}% ${((1 - Math.sin(x * Math.PI / 2)) * 100).toFixed(1)}%`; }).join(', ');
@@ -43,10 +53,11 @@ function waveSvg(peaks) {
     holds clips, each one a sound placed in time with a fade in and a fade out of its own. Sounds
     come from the Arranger's own browser. What is heard can be saved as one new sound. */
 export class Arranger {
-  /** @param {HTMLElement} root @param {Record<string, any>} h the page's helpers (see main.js) */
-  constructor(root, h) {
+  /** @param {HTMLElement} root */
+  constructor(root) {
     listen('arranger', (st) => this.passes(st));
-    this.root = root; this.h = h;
+    registerPlayer('arranger', () => this.stop());
+    this.root = root;
     this.a = empty();
     /** @type {Map<string, Sound>} */ this.sounds = new Map();
     /** @type {{ lane: Lane, clip: Clip } | null} */ this.sel = null;
@@ -60,15 +71,14 @@ export class Arranger {
     /** @type {number | null} */ this.zoomWant = null;
     this.zoomX = 0; this.zoomFrame = 0;
     /** @type {{ clip: Clip, t: number } | null} */ this.lastClick = null;
-    /** @type {string | undefined} */ this.lastDest = undefined;
+    /** Where the last mix was saved, offered again for the next. @type {string | undefined} */ this.lastPlace = undefined;
     /** What the native side says is heard: each lane, the clips a mix would hold, the first lane heard.
         @type {{ heard: boolean[], clips: number, first: string | null }} */
     this.shown = { heard: [], clips: 0, first: null };
-    const { el, ib, icon } = h;
     this.playBtn = ib('play_arrow', 'Play or stop (space)', () => this.toggle(), 'strong');
     this.loopBtn = ib('repeat', 'Loop (L)', () => this.set({ loop: !this.a.loop }), 'toggle');
     this.clock = el('span', { class: 'arr-clock' });
-    this.saveBtn = el('button', { class: 'primary', 'data-tip': 'Save what you hear as one new sound', onclick: () => this.bounce().catch(h.fail) }, icon('save'), 'Save mix');
+    this.saveBtn = el('button', { class: 'primary', 'data-tip': 'Save what you hear as one new sound', onclick: () => this.bounce().catch(fail) }, icon('save'), 'Save mix');
     this.clearBtn = ib('delete_sweep', 'Remove every lane from the Arranger', () => this.clear());
     this.browserBtn = ib('chevron_left', 'Hide the browser, for more room to arrange (B)', () => this.showBrowser(this.browser.root.hidden));
     /** @type {HTMLElement} */ (root.querySelector('.cmdline')).append(this.browserBtn, el('span', { class: 'sep' }), this.playBtn, this.loopBtn, this.clock, el('span', { class: 'spacer' }),
@@ -78,7 +88,7 @@ export class Arranger {
     this.scroll = el('div', { class: 'arr-scroll' });
 
     // Sounds come in from the Arranger's own browser: dragged onto a lane, or below the lanes for a new one.
-    this.browser = new ArrBrowser(h, (it) => { this.dropSound(it, 0, this.sel?.lane || null).catch(h.fail); });
+    this.browser = new ArrBrowser((it) => { this.dropSound(it, 0, this.sel?.lane || null).catch(fail); });
     this.browser.onDragEnd = () => this.dropLine(null);
     // A pinch on the trackpad arrives as a wheel event with ctrl held; cmd and scroll does the same.
     // WebKit also reports a pinch as its own gesture, with the scale since the fingers went down.
@@ -101,12 +111,10 @@ export class Arranger {
     this.scroll.addEventListener('drop', (e) => {
       const it = this.browser.dragging; if (!it) return;
       e.preventDefault(); this.browser.dragging = null; this.dropLine(null);
-      this.dropSound(it, this.magnet(this.timeAt(e), it.duration || 0).t, this.laneAt(e)).catch(h.fail);
+      this.dropSound(it, this.magnet(this.timeAt(e), it.duration || 0).t, this.laneAt(e)).catch(fail);
     });
     /** @type {HTMLElement} */ (root.querySelector('.stack')).append(el('div', { class: 'arr-body' }, this.browser.root, el('div', { class: 'arr-stage' }, this.scroll)));
-    let open = true;
-    try { open = localStorage.getItem('athar.arranger.browser') !== 'hidden'; } catch { }
-    this.showBrowser(open, false);
+    this.showBrowser(recall(BROWSER_KEY) !== 'hidden', false);
     window.addEventListener('resize', () => { if (this.visible()) this.render(); });
     this.render();
   }
@@ -118,10 +126,10 @@ export class Arranger {
   showBrowser(open, keep = true) {
     this.browser.root.hidden = !open;
     const tip = open ? 'Hide the browser, for more room to arrange (B)' : 'Show the browser (B)';
-    this.browserBtn.querySelector('.i').textContent = open ? 'chevron_left' : 'chevron_right';
+    /** @type {HTMLElement} */ (this.browserBtn.querySelector('.i')).textContent = open ? 'chevron_left' : 'chevron_right';
     this.browserBtn.dataset.tip = tip; this.browserBtn.setAttribute('aria-label', tip); this.browserBtn.setAttribute('aria-expanded', String(open));
     if (!keep) return;
-    try { localStorage.setItem('athar.arranger.browser', open ? 'shown' : 'hidden'); } catch { }
+    remember(BROWSER_KEY, open ? 'shown' : 'hidden');
     this.render();
   }
 
@@ -140,7 +148,7 @@ export class Arranger {
   flush() {
     if (!this.saveTimer) return this.saving;
     clearTimeout(this.saveTimer); this.saveTimer = undefined;
-    return this.saving = this.push(true).catch(this.h.fail);
+    return this.saving = this.push(true).catch(fail);
   }
   // The stored arrangement is read again each time, because a file renamed or moved elsewhere
   // in Athar has its new path there.
@@ -235,22 +243,22 @@ export class Arranger {
 
   // ---- lanes
   async addLane() {
-    if (this.a.lanes.length >= MAX_LANES) return this.h.notice(`The Arranger holds ${MAX_LANES} lanes. Remove one to add another.`, 6000);
-    const v = await this.h.modal('New lane', [{ label: 'Name, such as Drums, Vocal or Synth', value: `Lane ${this.a.lanes.length + 1}` }]);
+    if (this.a.lanes.length >= MAX_LANES) return notice(`The Arranger holds ${MAX_LANES} lanes. Remove one to add another.`, 6000);
+    const v = await modal('New lane', [{ label: 'Name, such as Drums, Vocal or Synth', value: `Lane ${this.a.lanes.length + 1}` }]);
     if (!v || !v[0]) return;
     this.a.lanes.push({ name: v[0].slice(0, 60), gain: 0, mute: false, solo: false, clips: [] });
     this.save(); this.render();
   }
   /** @param {Lane} lane */
   async renameLane(lane) {
-    const v = await this.h.modal('Name of the lane', [{ label: 'Name', value: lane.name }]);
+    const v = await modal('Name of the lane', [{ label: 'Name', value: lane.name }]);
     if (!v || !v[0]) return;
     lane.name = v[0].slice(0, 60);
     this.save(); this.render();
   }
   /** @param {Lane} lane */
   async removeLane(lane) {
-    if (lane.clips.length && !await this.h.confirmModal(`Remove ${lane.name}?`, `The lane and its ${plural(lane.clips.length, 'clip')} leave the Arranger. The files stay where they are.`, 'Remove')) return;
+    if (lane.clips.length && !await confirmModal(`Remove ${lane.name}?`, `The lane and its ${plural(lane.clips.length, 'clip')} leave the Arranger. The files stay where they are.`, 'Remove')) return;
     this.a.lanes = this.a.lanes.filter(l => l !== lane);
     if (this.sel?.lane === lane) this.sel = null;
     lane.clips.forEach(c => this.forget(c.path));
@@ -259,7 +267,7 @@ export class Arranger {
   }
   async clear() {
     if (!this.a.lanes.length) return;
-    if (!await this.h.confirmModal('Empty the Arranger?', 'Every lane leaves the Arranger. The files stay where they are.', 'Empty')) return;
+    if (!await confirmModal('Empty the Arranger?', 'Every lane leaves the Arranger. The files stay where they are.', 'Empty')) return;
     this.stop(); this.sounds.clear(); invoke('arr_keep', { paths: [] }).catch(() => { }); this.sel = null; this.cursor = 0;
     this.set({ lanes: [] });
   }
@@ -312,20 +320,19 @@ export class Arranger {
     let line = /** @type {HTMLElement | null} */ (grid.querySelector('.arr-dropline'));
     if (t == null) return void line?.remove();
     if (fromBrowser) (lane ? grid.querySelector(`.arr-row[data-li="${this.a.lanes.indexOf(lane)}"]`) : grid.querySelector('.arr-new'))?.classList.add('target');
-    if (!line) { line = /** @type {HTMLElement} */ (this.h.el('div', { class: 'arr-dropline' })); grid.append(line); }
+    if (!line) { line = /** @type {HTMLElement} */ (el('div', { class: 'arr-dropline' })); grid.append(line); }
     line.classList.toggle('guide', !fromBrowser);
     line.style.height = `${this.a.lanes.length * LANE_H}px`;
     line.style.transform = `translateX(${HEAD_W + t * this.pps}px)`;
   }
 
   /** Put a sound from the browser at time t, in a lane or, with none given, in a new lane named after it. */
-  /** @param {{ path: string, name: string, duration?: number, sr?: number }} it @param {number} t @param {Lane | null} [lane] */
+  /** @param {{ path: string, name: string, duration?: number | null, sr?: number | null }} it @param {number} t @param {Lane | null} [lane] */
   async dropSound(it, t, lane = null) {
-    const { notice } = this.h;
     if ((it.duration || 0) > MAX_SECONDS) return notice(`${it.name} is longer than ten minutes. Save a shorter piece of it from the editor first.`, 7000);
     if (!lane) {
       if (this.a.lanes.length >= MAX_LANES) return notice(`The Arranger holds ${MAX_LANES} lanes. Drop the sound onto one of them, or remove a lane.`, 6000);
-      lane = { name: stem(it.name).slice(0, 60), gain: 0, mute: false, solo: false, clips: [] };
+      lane = { name: stemOf(it.name).slice(0, 60), gain: 0, mute: false, solo: false, clips: [] };
       this.a.lanes.push(lane);
     }
     this.addClip(lane, { path: it.path, name: it.name, duration: it.duration || 0, sr: it.sr || 0, at: this.place(t), in: 0, out: 0 });
@@ -333,7 +340,7 @@ export class Arranger {
 
   /** @param {Lane} lane @param {Clip} clip */
   addClip(lane, clip) {
-    if (lane.clips.length >= MAX_HITS) return this.h.notice(`A lane holds ${MAX_HITS} clips at most.`);
+    if (lane.clips.length >= MAX_CLIPS) return notice(`A lane holds ${MAX_CLIPS} clips at most.`);
     lane.clips.push(clip);
     this.sel = { lane, clip };
     this.save(); this.render(); this.load(clip);
@@ -354,15 +361,15 @@ export class Arranger {
   // by clicking the time ruler), in the lane of the picked clip, or the lane it came from.
   /** @param {boolean} cut */
   copy(cut) {
-    const sel = this.sel; if (!sel) return this.h.notice('Click a clip in a lane first, then copy it.');
+    const sel = this.sel; if (!sel) return notice('Click a clip in a lane first, then copy it.');
     this.clip = { clip: { ...sel.clip }, lane: sel.lane };
     if (cut) this.removeClip(sel.lane, sel.clip);
-    this.h.toast(cut ? `Cut ${stem(sel.clip.name)}` : `Copied ${stem(sel.clip.name)}`);
+    toast(cut ? `Cut ${stemOf(sel.clip.name)}` : `Copied ${stemOf(sel.clip.name)}`);
   }
   paste() {
-    const c = this.clip; if (!c) return this.h.notice('Nothing copied yet.');
+    const c = this.clip; if (!c) return notice('Nothing copied yet.');
     const lane = this.sel?.lane || (this.a.lanes.includes(c.lane) ? c.lane : this.a.lanes[0]);
-    if (!lane) return this.dropSound(c.clip, this.cursor).catch(this.h.fail);
+    if (!lane) return this.dropSound(c.clip, this.cursor).catch(fail);
     let t = this.cursor;
     while (lane.clips.some(x => x.path === c.clip.path && Math.abs(x.at - t) < 1e-6)) t += c.clip.duration || 0.1;
     this.addClip(lane, { ...c.clip, at: this.place(t) });
@@ -374,12 +381,12 @@ export class Arranger {
     if (e.button !== 0) return;
     e.preventDefault(); e.stopPropagation();
     // Holding alt leaves a copy behind.
-    if (e.altKey && lane.clips.length < MAX_HITS) {
+    if (e.altKey && lane.clips.length < MAX_CLIPS) {
       lane.clips.push({ ...clip });
       const stay = /** @type {HTMLElement} */ (node.cloneNode(true)); stay.classList.remove('on'); node.before(stay);
     }
     this.sel = { lane, clip };
-    this.scroll.querySelectorAll('.arr-hit.on').forEach(n => n.classList.remove('on'));
+    this.scroll.querySelectorAll('.arr-clip.on').forEach(n => n.classList.remove('on'));
     node.classList.add('on');
     node.setPointerCapture(e.pointerId);
     const x0 = e.clientX, t0 = clip.at, from = this.a.lanes.indexOf(lane);
@@ -405,7 +412,7 @@ export class Arranger {
       node.removeEventListener('pointermove', move);
       this.dragging = false; this.dropLine(null);
       const target = this.a.lanes[to];
-      if (target && target !== lane && target.clips.length < MAX_HITS) {
+      if (target && target !== lane && target.clips.length < MAX_CLIPS) {
         lane.clips = lane.clips.filter(c => c !== clip);
         target.clips.push(clip);
         this.sel = { lane: target, clip };
@@ -416,7 +423,7 @@ export class Arranger {
       if (moved) { this.lastClick = null; return; }
       const now = performance.now(), again = this.lastClick?.clip === clip && now - this.lastClick.t < DOUBLE_CLICK_MS;
       this.lastClick = again ? null : { clip, t: now };
-      if (again && !this.sounds.get(clip.path)?.error) this.h.edit(clip);
+      if (again && !this.sounds.get(clip.path)?.error) openPath(clip);
     };
     node.addEventListener('pointermove', move);
     for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) node.addEventListener(type, up);
@@ -459,7 +466,7 @@ export class Arranger {
 
   // ---- drawing
   render() {
-    const { el, icon } = this.h, a = this.a, len = this.length();
+    const a = this.a, len = this.length();
     this.loopBtn.classList.toggle('on', a.loop); this.loopBtn.setAttribute('aria-pressed', String(a.loop));
     this.playBtn.disabled = this.saveBtn.disabled = !this.all().length;
     this.clearBtn.disabled = !a.lanes.length;
@@ -468,7 +475,7 @@ export class Arranger {
       this.nodes = null;
       this.scroll.replaceChildren(el('div', { class: 'empty' }, el('h3', {}, 'Nothing to arrange yet'),
         el('p', { class: 'muted' }, 'Drag a sound here from the browser on the left: it gets a lane of its own. Or make a lane first, name it (Drums, Vocal, Synth), and drop sounds into it.'),
-        el('div', { class: 'actions' }, el('button', { class: 'ghost', onclick: () => this.addLane().catch(this.h.fail) }, icon('add'), 'Add a lane'))));
+        el('div', { class: 'actions' }, el('button', { class: 'ghost', onclick: () => this.addLane().catch(fail) }, icon('add'), 'Add a lane'))));
       this.head = null; this.showClock(0);
       return;
     }
@@ -485,7 +492,7 @@ export class Arranger {
   }
 
   rulerRow() {
-    const { el } = this.h, end = this.trackW / this.pps;
+    const end = this.trackW / this.pps;
     /** @type {[number, string][]} */
     const marks = [];
     const step = TICKS.find(s => s * this.pps >= 72) || TICKS[TICKS.length - 1];
@@ -501,29 +508,28 @@ export class Arranger {
 
   /** @param {Lane} lane @param {number} li */
   laneRow(lane, li) {
-    const { el, ib, focusable } = this.h;
     const flag = (/** @type {string} */ label, /** @type {'mute' | 'solo'} */ key, /** @type {string} */ tip) => el('button', { class: 'ib toggle' + (lane[key] ? ' on' : ''), 'data-tip': tip, 'aria-label': tip, 'aria-pressed': String(lane[key]),
-      onclick: () => { lane[key] = !lane[key]; this.save(); this.render(); } }, this.h.icon(label));
+      onclick: () => { lane[key] = !lane[key]; this.save(); this.render(); } }, icon(label));
     const gain = el('input', { type: 'range', min: MIN_GAIN_DB, max: MAX_GAIN_DB, step: 0.5, 'aria-label': `Level of ${lane.name}` });
     const tell = () => { gain.dataset.tip = `Level ${this.gainText(lane.gain)}. Double-click to set it back to 0 dB`; gain.setAttribute('aria-valuetext', this.gainText(lane.gain)); };
     gain.value = String(lane.gain); tell();
     gain.oninput = () => { lane.gain = Number(gain.value); tell(); this.clock.textContent = this.gainText(lane.gain); this.save(); };
     gain.onchange = () => this.placeHead();
     gain.ondblclick = () => { gain.value = '0'; gain.dispatchEvent(new Event('input')); };
-    const rename = () => this.renameLane(lane).catch(this.h.fail);
+    const rename = () => this.renameLane(lane).catch(fail);
     const head = el('div', { class: 'arr-head' },
       flag('volume_off', 'mute', 'Mute (M)'), flag('headphones', 'solo', 'Solo: hear only this lane and the other soloed ones (S)'),
       focusable(el('span', { class: 'qn arr-lname', 'data-tip': 'Double-click to rename the lane', ondblclick: rename }, lane.name), rename),
       gain,
-      ib('close', 'Remove this lane. The files stay where they are', () => this.removeLane(lane).catch(this.h.fail)));
+      ib('close', 'Remove this lane. The files stay where they are', () => this.removeLane(lane).catch(fail)));
     const track = el('div', { class: 'arr-track',
-      onpointerdown: (/** @type {PointerEvent} */ e) => { if (!/** @type {Element} */ (e.target).closest('.arr-hit') && this.sel) { this.sel = null; this.scroll.querySelectorAll('.arr-hit.on').forEach(n => n.classList.remove('on')); } } },
+      onpointerdown: (/** @type {PointerEvent} */ e) => { if (!/** @type {Element} */ (e.target).closest('.arr-clip') && this.sel) { this.sel = null; this.scroll.querySelectorAll('.arr-clip.on').forEach(n => n.classList.remove('on')); } } },
       lane.clips.map((clip) => {
         const s = this.sounds.get(clip.path);
-        const node = el('div', { class: 'arr-hit' + (this.sel?.clip === clip ? ' on' : '') + (s?.error ? ' missing' : '') + (s && !s.info && !s.error ? ' loading' : ''),
+        const node = el('div', { class: 'arr-clip' + (this.sel?.clip === clip ? ' on' : '') + (s?.error ? ' missing' : '') + (s && !s.info && !s.error ? ' loading' : ''),
           style: `left:${clip.at * this.pps}px;width:${Math.max(4, clip.duration * this.pps)}px`, 'data-tip': s?.error ? `Not found: ${clip.path}` : null });
         node.innerHTML = s?.svg || '';
-        node.append(el('span', { class: 'arr-cname' }, stem(clip.name)),
+        node.append(el('span', { class: 'arr-cname' }, stemOf(clip.name)),
           el('span', { class: 'arr-fade in' }), el('span', { class: 'arr-fade out' }),
           .../** @type {('in' | 'out')[]} */ (['in', 'out']).map(side => el('span', { class: `arr-fh ${side}`, 'data-tip': `Drag to fade ${side}`, onpointerdown: (/** @type {PointerEvent} */ e) => this.dragFade(e, clip, side, node) })));
         /** @type {HTMLElement} */ (node.querySelector('.arr-fade.in')).style.clipPath = WEDGE_IN; /** @type {HTMLElement} */ (node.querySelector('.arr-fade.out')).style.clipPath = WEDGE_OUT;
@@ -537,9 +543,8 @@ export class Arranger {
 
   // Under the last lane: the way to make an empty lane, and the place a dragged sound becomes a new one.
   newRow() {
-    const { el, icon } = this.h;
     return el('div', { class: 'arr-row arr-new' },
-      el('div', { class: 'arr-head' }, el('button', { class: 'ghost', onclick: () => this.addLane().catch(this.h.fail) }, icon('add'), 'Add a lane')),
+      el('div', { class: 'arr-head' }, el('button', { class: 'ghost', onclick: () => this.addLane().catch(fail) }, icon('add'), 'Add a lane')),
       el('div', { class: 'arr-track' }));
   }
 
@@ -554,7 +559,7 @@ export class Arranger {
 
   // ---- playback
   // Played natively: save() sends the arrangement whenever it changes.
-  syncPlay() { this.playBtn.querySelector('.i').textContent = this.playing ? 'stop' : 'play_arrow'; }
+  syncPlay() { /** @type {HTMLElement} */ (this.playBtn.querySelector('.i')).textContent = this.playing ? 'stop' : 'play_arrow'; }
 
   toggle() { if (this.playing) this.stop(); else this.start(); }
 
@@ -562,13 +567,13 @@ export class Arranger {
     this.stop();
     const len = this.length();
     if (!len || !this.all().some(x => this.sounds.get(x.clip.path)?.info)) return;
-    this.h.stopOthers();
+    stopOthers('arranger');
     const from = this.cursor < len ? this.cursor : 0;
     /** @type {Playing} */
     const p = { passes: [[now() + 0.05, from]] };
     this.playing = p;
     this.syncPlay();
-    try { await this.push(false); p.passes = [[await invoke('arr_play', { from }), from]]; } catch (e) { if (this.playing === p) this.stop(); return this.h.fail(e); }
+    try { await this.push(false); p.passes = [[await invoke('arr_play', { from }), from]]; } catch (e) { if (this.playing === p) this.stop(); return fail(e); }
     const tick = () => {
       if (this.playing !== p) return;
       if (!this.dragging) this.placeHead(this.position(p, now()));
@@ -600,28 +605,22 @@ export class Arranger {
 
   // ---- saving what is heard as one sound
   async bounce() {
-    const { modal, notice, toast } = this.h, a = this.a;
     await this.push(false);
     const { clips, first } = this.shown;
     if (!clips) return notice('No lane is sounding, so there is nothing to save.');
-    const [folders, projects] = await Promise.all([lib.folders(), lib.projects()]);
-    /** @type {[string, string][]} */
-    const options = [...projects.filter((/** @type {any} */ p) => p.folder).map((/** @type {any} */ p) => [`p:${p.id}`, `Project: ${p.name}`]), ...folders.filter((/** @type {any} */ f) => !f.offline).map((/** @type {any} */ f) => [`f:${f.path}`, `Library: ${f.path.split('/').pop()}`])];
-    if (!options.length) return notice('Add a folder to the Library first, with Add folder on the Library page. The mix is saved there.');
-    const v = await modal(`Save the mix of ${plural(clips, 'clip')}`, [{ label: 'Name', value: `${first || 'Arranger'} mix` }, { label: 'Into', options, value: options.some(o => o[0] === this.lastDest) ? this.lastDest : undefined }]);
-    if (!v || !v[0]) return;
-    this.lastDest = v[1];
-    const proj = v[1].startsWith('p:') ? projects.find((/** @type {any} */ p) => `p:${p.id}` === v[1]) : null, dir = proj ? proj.folder : v[1].slice(2);
-    const st = this.h.settings();
+    const to = await askSavePlace(`Save the mix of ${plural(clips, 'clip')}`, `${first || 'Arranger'} mix`, this.lastPlace, 'Add a folder to the Library first, with Add folder on the Library page. The mix is saved there.');
+    if (!to) return;
+    this.lastPlace = to.place;
+    const st = SETTINGS;
     this.saveBtn.disabled = true;
     try {
       // Each heard clip is mixed as a sound placed once, at its lane's level, with its own fades.
       await this.push(false);
-      const { path, over } = await lib.saveMix({ rate: st.export_rate || 0, bits: st.export_bits || 24, mono: !!st.export_mono }, { dest_dir: dir, name: `${v[0]}.wav`, format: st.export_format || 'wav' });
-      if (proj) await lib.projectItem(proj.id, { path });
-      const saved = `Saved ${path.split('/').pop()}${proj ? ` into ${proj.name}` : ''}`;
+      const { path, over } = await lib.saveMix({ rate: st.export_rate || 0, bits: st.export_bits || 24, mono: !!st.export_mono }, { dest_dir: to.dir, name: `${to.name}.wav`, format: st.export_format || 'wav' });
+      if (to.project) await lib.projectItem(to.project.id, { path });
+      const saved = `Saved ${baseOf(path)}${to.project ? ` into ${to.project.name}` : ''}`;
       if (over) notice(`${saved}. The mix was ${over.toFixed(1)} dB over full scale, so it was turned down to fit.`, 8000); else toast(saved);
-      this.h.onSave();
+      refreshSide(); refreshSideSoon();
     } finally { this.saveBtn.disabled = !this.all().length; }
   }
 

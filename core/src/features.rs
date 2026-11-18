@@ -1,14 +1,15 @@
 //! CLAP's audio input: 10 s at 48 kHz, repeated to fill, then a 64-band Slaney log-mel
-//! spectrogram. A port of `clap_features` in athar/engine.py, which matches the model's own
-//! feature extractor ("rand_trunc" with "repeatpad").
+//! spectrogram. This is what the model's own feature extractor computes in its "rand_trunc"
+//! mode with "repeatpad" padding; stored vectors depend on it staying exactly so.
 
+use crate::spectrum::hann;
 use realfft::RealFftPlanner;
 use std::sync::OnceLock;
 
 pub const SR: usize = 48_000;
 pub const SECONDS: usize = 10;
-pub const N_FFT: usize = 1024;
-pub const HOP: usize = 480;
+const N_FFT: usize = 1024;
+const HOP: usize = 480;
 pub const N_MELS: usize = 64;
 pub const FRAMES: usize = SR * SECONDS / HOP + 1;
 const FMIN: f64 = 50.0;
@@ -29,7 +30,7 @@ fn mel_to_hz(m: f64) -> f64 {
 
 /// librosa.filters.mel(htk=False, norm="slaney"), rounded to f32 as librosa stores it: n_mels
 /// rows of n_fft/2+1 weights.
-pub fn mel(sr: f64, n_fft: usize, n_mels: usize, fmin: f64, fmax: f64) -> Vec<Vec<f64>> {
+pub(crate) fn mel(sr: f64, n_fft: usize, n_mels: usize, fmin: f64, fmax: f64) -> Vec<Vec<f64>> {
     let bins = n_fft / 2 + 1;
     let fft_freqs: Vec<f64> = (0..bins).map(|k| k as f64 * (sr / 2.0) / (bins - 1) as f64).collect();
     let (lo, hi) = (hz_to_mel(fmin), hz_to_mel(fmax));
@@ -50,7 +51,7 @@ pub fn mel(sr: f64, n_fft: usize, n_mels: usize, fmin: f64, fmax: f64) -> Vec<Ve
 }
 
 /// CLAP's filterbank: 48 kHz, 1024-point FFT, 64 bands from 50 Hz to 14 kHz.
-pub fn mel_filters() -> &'static Vec<Vec<f64>> {
+fn mel_filters() -> &'static Vec<Vec<f64>> {
     static MEL: OnceLock<Vec<Vec<f64>>> = OnceLock::new();
     MEL.get_or_init(|| mel(SR as f64, N_FFT, N_MELS, FMIN, FMAX))
 }
@@ -75,7 +76,7 @@ pub fn clap_features(y: &[f32]) -> Vec<f32> {
     padded.extend_from_slice(&x);
     padded.extend((1..=half).map(|i| x[n - 1 - i]));
 
-    let hann: Vec<f64> = (0..N_FFT).map(|k| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / N_FFT as f64).cos()).collect();
+    let window = hann(N_FFT, true);
     let fft = RealFftPlanner::<f64>::new().plan_fft_forward(N_FFT);
     let mut frame = fft.make_input_vec();
     let mut spec = fft.make_output_vec();
@@ -85,7 +86,7 @@ pub fn clap_features(y: &[f32]) -> Vec<f32> {
     for f in 0..FRAMES {
         let start = f * HOP;
         for k in 0..N_FFT {
-            frame[k] = padded[start + k] * hann[k];
+            frame[k] = padded[start + k] * window[k];
         }
         fft.process(&mut frame, &mut spec).expect("FFT sizes are fixed");
         for (p, c) in power.iter_mut().zip(&spec) {

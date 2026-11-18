@@ -1,24 +1,27 @@
+import { el, ib, icon, fail, busy } from './ui.js';
 import { lib } from './native.js';
 import { invoke } from './engine.js';
 import { fmtTime } from './time.js';
+import { fitCanvas, palette, monoFont } from './canvas.js';
+import { togglePreview, stopPreview } from './preview.js';
+import { openPath } from './editing.js';
 
 const DOT = 4.5, HIT = 12, DWELL_MS = 140;
 
-/** The library as a map: sounds that sound alike sit near each other. Hover to hear, click to
-    keep one, drag to move around, scroll to zoom. */
 /** A sound on the map, at x and y between 0 and 1.
     @typedef {{ path: string, name: string, x: number, y: number, category: string | null, family: string | null, duration: number, sr: number }} Point */
 /** A group name at the middle of its sounds; key is `g:` and a family or `c:` and a kind. @typedef {{ key: string, text: string, n: number, x: number, y: number }} Name */
 /** Where a group name was drawn, to find it under the pointer. @typedef {{ x: number, y: number, w: number, h: number, name: string }} NameBox */
-/** @typedef {typeof import('./ui.js')} UI */
-/** What the page uses from main.js.
-    @typedef {{ el: UI['el'], ib: UI['ib'], icon: UI['icon'], fail: UI['fail'], busy: UI['busy'],
-      preview(p: Point): void, stop(): void, edit(p: Point): void, similar(p: Point): void }} SoundMapHelpers */
 
+// A point carries the path and name that the preview reads of a Library sound.
+const preview = (/** @type {Point} */ p) => togglePreview(/** @type {import('./search.js').Item} */ (/** @type {unknown} */ (p)), true);
+
+/** The library as a map: sounds that sound alike sit near each other. Hover to hear, click to
+    keep one, drag to move around, scroll to zoom. */
 export class SoundMap {
-  /** @param {HTMLElement} root @param {SoundMapHelpers} h */
-  constructor(root, h) {
-    this.root = root; this.h = h;
+  /** @param {HTMLElement} root @param {(p: Point) => void} findInLibrary Shows the Library searched for a sound like `p`. */
+  constructor(root, findInLibrary) {
+    this.root = root; this.findInLibrary = findInLibrary;
     /** @type {Point[]} */
     this.points = [];
     this.zoom = 1; this.ox = 0; this.oy = 0;
@@ -37,7 +40,6 @@ export class SoundMap {
     /** @type {{ key: string, canvas: HTMLCanvasElement } | undefined} */ this.land;
     /** The names for one zoom step, and the step asked for. @type {{ stamp: string, level: number, list: Name[] } | undefined} */ this.named;
     /** @type {string | undefined} */ this.namesWant;
-    const { el, ib } = h;
     this.canvas = el('canvas', { class: 'map-canvas', tabindex: '0', 'aria-label': 'Map of your sounds' });
     this.info = el('div', { class: 'map-info' });
     this.note = el('span', { class: 'scope' });
@@ -50,15 +52,15 @@ export class SoundMap {
   }
 
   async show() {
-    if (!this.points.length) this.h.busy('Laying out your sounds');
+    if (!this.points.length) busy('Laying out your sounds');
     try {
       /** @type {Point[]} */
       const pts = await lib.soundMap();
       this.points = pts; this.stamp = String(Date.now());
       this.note.textContent = pts.length ? '' : 'Add a folder of sounds to see the map';
       if (this.picked && !pts.some(p => p.path === /** @type {Point} */ (this.picked).path)) this.picked = null;
-      this.h.busy('');
-    } catch (e) { this.h.fail(e); }
+      busy('');
+    } catch (e) { fail(e); }
     this.paintInfo(); this.draw();
   }
 
@@ -77,11 +79,9 @@ export class SoundMap {
   }
 
   paint() {
-    const cv = this.canvas, dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
-    if (!W || !H) return;
-    if (cv.width !== W * dpr || cv.height !== H * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
-    const g = /** @type {CanvasRenderingContext2D} */ (cv.getContext('2d')), css = getComputedStyle(document.documentElement), seen = /** @type {Record<string, string>} */ ({}), col = (/** @type {string} */ n) => seen[n] ??= css.getPropertyValue(n).trim();
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const fit = fitCanvas(this.canvas);
+    if (!fit) return;
+    const { g, W, H } = fit, read = palette(), seen = /** @type {Record<string, string>} */ ({}), col = (/** @type {string} */ n) => seen[n] ??= read(n);
     g.fillStyle = col('--wave-bg'); g.fillRect(0, 0, W, H);
     const at = this.points.map(p => this.place(p, W, H));
     // Only a name tag lights up a whole kind. A single sound under the pointer lights up only itself.
@@ -102,7 +102,7 @@ export class SoundMap {
     // Names for the groups of sounds on screen. Far out they are broad families; closer in, the
     // kinds within them; closer still, the word their file names share, on its own. Bigger groups are named
     // first, and a name that would cover another is left out.
-    g.font = '13px "Share Tech Mono", ui-monospace, monospace';
+    g.font = monoFont(13);
     /** @type {{ x: number, y: number, w: number, h: number }[]} */
     const placed = []; this.labels = [];
     for (const l of this.names()) {
@@ -243,9 +243,9 @@ export class SoundMap {
       this.hover = p; this.hoverCat = over; this.draw();
       clearTimeout(dwell);
       // A sound started by resting on its dot stops as soon as the pointer leaves that dot.
-      if (this.hoverPlaying && this.hoverPlaying !== p) { this.hoverPlaying = null; this.h.stop(); }
+      if (this.hoverPlaying && this.hoverPlaying !== p) { this.hoverPlaying = null; stopPreview(); }
       // A short rest on a dot plays it, so sweeping across the map is not a wall of noise.
-      if (p) dwell = setTimeout(() => { if (this.hover === p) { this.hoverPlaying = p; this.h.preview(p); } }, DWELL_MS);
+      if (p) dwell = setTimeout(() => { if (this.hover === p) { this.hoverPlaying = p; preview(p); } }, DWELL_MS);
     });
     cv.addEventListener('pointerup', (e) => {
       const d = drag; drag = null;
@@ -256,30 +256,30 @@ export class SoundMap {
       if (over) { this.lockCat = this.lockCat === over ? null : over; return this.draw(); }
       const p = this.nearest(e.offsetX, e.offsetY);
       // A clicked sound plays to its end, wherever the pointer goes next.
-      if (p) { clearTimeout(dwell); this.picked = p; this.hoverPlaying = null; this.h.preview(p); this.paintInfo(); }
+      if (p) { clearTimeout(dwell); this.picked = p; this.hoverPlaying = null; preview(p); this.paintInfo(); }
       else this.lockCat = null;
       this.draw();
     });
-    cv.addEventListener('pointerleave', () => { clearTimeout(dwell); if (this.hoverPlaying) { this.hoverPlaying = null; this.h.stop(); } this.pointer = null; this.hover = null; this.hoverCat = null; this.draw(); });
+    cv.addEventListener('pointerleave', () => { clearTimeout(dwell); if (this.hoverPlaying) { this.hoverPlaying = null; stopPreview(); } this.pointer = null; this.hover = null; this.hoverCat = null; this.draw(); });
     cv.addEventListener('wheel', (e) => { e.preventDefault(); this.zoomBy(e.deltaY < 0 ? 1.15 : 1 / 1.15, e.offsetX, e.offsetY); }, { passive: false });
   }
 
   paintInfo() {
-    const { el, ib, icon } = this.h, p = this.picked;
+    const p = this.picked;
     this.info.hidden = !p;
     if (!p) return this.info.replaceChildren();
     this.info.replaceChildren(
-      ib('play_arrow', 'Play', () => this.h.preview(p)),
+      ib('play_arrow', 'Play', () => preview(p)),
       el('span', { class: 'qn' }, p.name), el('span', { class: 'muted' }, [p.category, fmtTime(p.duration)].filter(Boolean).join(', ')),
       el('span', { class: 'spacer' }),
-      el('button', { class: 'ghost', onclick: () => this.h.similar(p) }, icon('queue_music'), 'Find in Library'),
-      el('button', { class: 'primary', onclick: () => this.h.edit(p) }, icon('edit'), 'Edit'));
+      el('button', { class: 'ghost', onclick: () => this.findInLibrary(p) }, icon('queue_music'), 'Find in Library'),
+      el('button', { class: 'primary', onclick: () => openPath(p) }, icon('edit'), 'Edit'));
   }
 
   /** @param {KeyboardEvent} e */
   handleKey(e) {
-    if (e.key === ' ' && (this.picked || this.hover)) { e.preventDefault(); this.h.preview(/** @type {Point} */ (this.picked || this.hover)); return true; }
-    if (e.key === 'Escape') { this.h.stop(); return true; }
+    if (e.key === ' ' && (this.picked || this.hover)) { e.preventDefault(); preview(/** @type {Point} */ (this.picked || this.hover)); return true; }
+    if (e.key === 'Escape') { stopPreview(); return true; }
     if (e.key === '=' || e.key === '+') { this.zoomBy(1.4); return true; }
     if (e.key === '-') { this.zoomBy(1 / 1.4); return true; }
     return false;

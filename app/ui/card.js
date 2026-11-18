@@ -1,23 +1,18 @@
-// The sound card: the top of the Library, for the sound selected.
+// The sound card: the top of the Library, for the sound selected. Also the Library's keys.
 
-import { $, el, ib, icon, fail, notice, dialog } from './ui.js';
+import { $, el, ib, icon, fail, notice, dialog, confirmModal } from './ui.js';
 import { fmtTime } from './time.js';
 import { lib } from './native.js';
 import { state } from './store.js';
+import { baseOf, extOf, stemOf } from './names.js';
+import { palette } from './canvas.js';
+import { placeChip, originChip } from './places.js';
+import { player, isPlaying, togglePreview, stopPreview, setPreviewLoop, onPreviewChange } from './preview.js';
+import { openPath } from './editing.js';
+import { loadCats, loadFolders, loadProjects, refreshSideSoon } from './sidebar.js';
+import { removeFromProject, renderList, row, scopeText, search, select } from './search.js';
 
 /** @typedef {import('./search.js').Item} Item */
-/** @typedef {import('./search.js').Main} Main */
-/** @typedef {typeof import('./search.js')} Search */
-
-
-// What the card uses from the rest of the Library page; main.js fills these in.
-/** @typedef {Pick<Main, 'isPlaying' | 'openPath' | 'originChip' | 'placeChip' | 'refreshSide' | 'stopPreview' | 'togglePreview' | 'trashSound'>
-      & Pick<Search, 'removeFromProject' | 'renderList' | 'row' | 'search' | 'select'>
-      & { player: import('./player.js').Player, loadProjects: typeof import('./sidebar.js').loadProjects }} CardHost */
-export const host = /** @type {CardHost} */ (/** @type {unknown} */ ({ player: null }));
-// ---------- the sound card (top of the Library)
-export const extOf = (/** @type {string} */ n) => (n.match(/\.[^.]+$/) || [''])[0];
-export const stemOf = (/** @type {string} */ n) => n.replace(/\.[^.]+$/, '');
 
 export async function loadTags() {
   state.allTags = await lib.tags();
@@ -28,26 +23,26 @@ export async function loadTags() {
   sel.append(el('option', { value: '' }, 'any'));
   state.allTags.forEach(t => sel.append(el('option', { value: t.tag }, `${t.tag} (${t.count})`)));
   sel.value = state.tag || '';
-  if (gone) host.search();
+  if (gone) search();
 }
 
-export function drawCardWave() {
+function drawCardWave() {
   const cv = $('#card canvas.big'); if (!cv || !state.cardItem) return;
   const g = cv.getContext('2d'), W = cv.width, H = cv.height;
-  const css = getComputedStyle(document.documentElement);
-  const p = host.isPlaying(state.cardItem) && host.player.duration ? host.player.currentTime / host.player.duration : 0;
+  const col = palette(), played = col('--hi'), rest = col('--wave');
+  const p = isPlaying(state.cardItem) && player.duration ? player.currentTime / player.duration : 0;
   g.clearRect(0, 0, W, H);
   const peaks = state.cardItem.peaks || [], n = peaks.length || 1, bw = W / n;
   for (let i = 0; i < n; i++) {
     const h = Math.max(2, peaks[i] / 255 * (H - 16));
-    g.fillStyle = i / n < p ? css.getPropertyValue('--hi') : css.getPropertyValue('--wave');
+    g.fillStyle = i / n < p ? played : rest;
     g.fillRect(i * bw + 1, (H - h) / 2, Math.max(1, bw - 2), h);
   }
 }
 
 // Resolves to true when the saved item is still on the card, false when it moved on, null on failure.
 /** @param {{ tags?: string[], memo?: string, rating?: number }} changes @param {string} [path] */
-export async function saveCatalog(changes, path = state.cardItem?.path) {
+async function saveCatalog(changes, path = state.cardItem?.path) {
   if (!path) return false;
   try {
     const r = await lib.catalog({ path, ...changes });
@@ -57,7 +52,7 @@ export async function saveCatalog(changes, path = state.cardItem?.path) {
       Object.assign(state.items[i], fresh);
       const n = $('#results').querySelector(`.qitem[data-i="${i}"]`);
       if (n) {
-        const fresher = host.row(state.items[i], i, n.querySelector('.qmatch')?.style.width);
+        const fresher = row(state.items[i], i, n.querySelector('.qmatch')?.style.width);
         const focused = n === document.activeElement;
         n.replaceWith(fresher);
         if (focused) fresher.focus({ preventScroll: true });
@@ -70,21 +65,21 @@ export async function saveCatalog(changes, path = state.cardItem?.path) {
 }
 
 /** @param {string} stem */
-export async function renameCard(stem) {
+async function renameCard(stem) {
   const target = state.cardItem;
   if (!target || !stem.trim() || stem === stemOf(target.name)) return;
   const old = target.path;
   try {
     const { path } = await lib.rename({ path: old, name: stem.trim() });
-    const name = path.split('/').pop();
+    const name = baseOf(path);
     for (const x of [target, ...state.items]) if (x.path === old) Object.assign(x, { path, name });
-    host.renderList();
+    renderList();
     if (state.cardItem === target) renderCard();
   } catch (e) { fail(e); if (state.cardItem === target) renderCard(); }
 }
 
 /** @param {number} k */
-export function setRating(k) {
+function setRating(k) {
   const it = state.cardItem;
   if (!it) return;
   saveCatalog({ rating: k }, it.path).then(here => { if (here) renderCard(); });
@@ -96,6 +91,12 @@ let memoTimer;
 let memoFlush = null;
 /** @type {ReturnType<typeof tagSuggest> | null} */
 let cardSuggest = null;
+const projectChoices = () => [
+  el('option', { value: '' }, state.projects.length ? 'Add to project' : 'No projects yet'),
+  ...state.projects.map(p => el('option', { value: p.id }, p.name))];
+// The card's project menu follows projects being made, renamed or removed while it shows.
+window.addEventListener('athar:projects', () => $('#cardProject')?.replaceChildren(...projectChoices()));
+
 export function renderCard() {
   memoFlush?.();
   cardSuggest?.close(); cardSuggest = null;
@@ -107,12 +108,13 @@ export function renderCard() {
     el('span', {}, fmtTime(it.duration)),
     el('span', {}, `${it.sr ? (it.sr / 1000) + ' kHz' : ''} ${it.channels === 1 ? 'mono' : 'stereo'}`),
     el('span', {}, extOf(it.name).replace('.', '').toUpperCase()),
-    host.placeChip(it), host.originChip(it));
+    placeChip(it), originChip(it));
   const cv = el('canvas', { class: 'big', width: 1200, height: 240, 'data-tip': 'Click to play from that point' });
   cv.onclick = (e) => {
     const r = cv.getBoundingClientRect(), f = (e.clientX - r.left) / r.width;
-    const seek = () => { if (host.player.duration) host.player.currentTime = f * host.player.duration; };
-    if (!host.isPlaying(it)) { host.togglePreview(it, true); host.player.addEventListener('loadedmetadata', seek); } else seek();
+    // The sound may still be loading when the seek is asked for, and another may be chosen before it has.
+    const seek = () => { if (isPlaying(it) && player.duration) player.currentTime = f * player.duration; };
+    if (!isPlaying(it)) { togglePreview(it, true); player.addEventListener('loadedmetadata', seek); } else seek();
   };
 
   const nameIn = el('input', { id: 'cardName', spellcheck: 'false', 'aria-label': 'File name' });
@@ -169,32 +171,30 @@ export function renderCard() {
   memo.onblur = () => memoFlush?.();
   memo.onkeydown = (e) => { if (e.key === 'Escape') memo.blur(); };
 
-  const proj = el('select', { id: 'cardProject', 'aria-label': 'Project' },
-    el('option', { value: '' }, state.projects.length ? 'Add to project' : 'No projects yet'),
-    state.projects.map(p => el('option', { value: p.id }, p.name)));
+  const proj = el('select', { id: 'cardProject', 'aria-label': 'Project' }, projectChoices());
   proj.onchange = async () => {
     const pid = proj.value;
     if (!pid) return;
     proj.value = '';
     try {
       await lib.projectItem(pid, { path: it.path });
-      host.loadProjects().catch(() => { });
+      loadProjects().catch(() => { });
       const p = state.projects.find(x => String(x.id) === String(pid));
       notice(`Copied into the project ${p?.name || ''}. The original stays in the Library.`);
-      setTimeout(() => host.refreshSide(), 2500);
+      refreshSideSoon();
     }
     catch (e) { fail(e); }
   };
 
   const actions = el('div', { class: 'actions' },
-    ib(host.isPlaying(it) ? 'stop' : 'play_arrow', 'Play', () => playStop(it), 'strong lplay'),
-    ib('repeat', 'Loop', () => { state.libLoop = !state.libLoop; host.player.loop = state.libLoop; renderCardPlayState(); }, 'toggle lloop' + (state.libLoop ? ' on' : '')),
+    ib(isPlaying(it) ? 'stop' : 'play_arrow', 'Play', () => togglePreview(it), 'strong lplay'),
+    ib('repeat', 'Loop', () => { setPreviewLoop(!state.libLoop); renderCardPlayState(); }, 'toggle lloop' + (state.libLoop ? ' on' : '')),
     proj,
     el('span', { class: 'spacer' }),
-    state.project ? ib('playlist_remove', 'Remove from this project', () => host.removeFromProject(it)) : null,
+    state.project ? ib('playlist_remove', 'Remove from this project', () => removeFromProject(it)) : null,
     ib('folder_open', 'Show in Finder', () => lib.reveal({ path: it.path }).catch(fail)),
-    ib('delete', 'Delete file (Backspace)', () => host.trashSound(it)),
-    el('button', { class: 'primary', onclick: () => host.openPath(it), 'data-tip': 'Open in the editor (E, or double-click in the list)' }, icon('edit'), ' Edit'));
+    ib('delete', 'Delete file (Backspace)', () => trashSound(it)),
+    el('button', { class: 'primary', onclick: () => openPath(it), 'data-tip': 'Open in the editor (E, or double-click in the list)' }, icon('edit'), ' Edit'));
 
   box.append(
     el('div', { class: 'stage-main' }, el('div', { class: 'stage-head' }, name, rating), meta, cv, actions),
@@ -205,7 +205,7 @@ export function renderCard() {
 
 // Tag suggestions in the app's own menu style instead of the browser's datalist.
 /** @param {HTMLInputElement} input @param {() => string[]} options @param {(t: string) => void} pick */
-export function tagSuggest(input, options, pick) {
+function tagSuggest(input, options, pick) {
   /** @type {HTMLElement | null} */
   let menu = null;
   /** @type {string[]} */
@@ -246,14 +246,10 @@ export function tagSuggest(input, options, pick) {
   };
 }
 
-/** @param {Item} it */
-export function playStop(it) {
-  if (host.isPlaying(it)) host.stopPreview(); else host.togglePreview(it, true);
-}
-export function renderCardPlayState() {
+function renderCardPlayState() {
   const b = $('#card .actions .ib.lplay'), l = $('#card .actions .ib.lloop');
   if (b) {
-    const here = host.isPlaying(state.cardItem);
+    const here = isPlaying(state.cardItem);
     b.querySelector('.i').textContent = here ? 'stop' : 'play_arrow';
     const t = here ? 'Stop' : 'Play';
     b.dataset.tip = t; b.setAttribute('aria-label', t);
@@ -265,26 +261,50 @@ export function renderCardPlayState() {
   }
 }
 
-/** @param {KeyboardEvent} e */
+// The card's play button and waveform follow the preview: when it starts or stops, and while it plays.
+onPreviewChange(() => { renderCardPlayState(); drawCardWave(); });
+(function tick() {
+  if (player.duration && isPlaying(state.cardItem)) drawCardWave();
+  requestAnimationFrame(tick);
+})();
+
+/** Deletes the sound's file, after asking. @param {Item} it */
+async function trashSound(it) {
+  if (!await confirmModal('Delete file?', `This deletes ${it.name} itself, not just its place in Athar.`, 'Delete')) return;
+  try {
+    if (isPlaying(it)) stopPreview();
+    await lib.trash({ path: it.path });
+    const i = state.items.findIndex(x => x.path === it.path);
+    if (i >= 0) state.items.splice(i, 1);
+    state.cardItem = null;
+    state.selected = Math.min(Math.max(0, i), state.items.length - 1);
+    $('#scope').textContent = scopeText();
+    renderList();
+    if (state.items.length) select(state.selected); else renderCard();
+    loadFolders().catch(() => { }); loadCats().catch(() => { }); loadProjects().catch(() => { }); loadTags().catch(() => { });
+  } catch (e) { fail(e); }
+}
+
+/** The Library page's keys. @param {KeyboardEvent} e */
 export function soundsKey(e) {
   if (e.ctrlKey || e.altKey || (e.metaKey && e.key !== 'Backspace')) return;
   const k = e.key.toLowerCase(), it = state.cardItem;
-  if (k === 'j' || e.key === 'ArrowDown') { e.preventDefault(); host.select(Math.min(state.items.length - 1, state.selected + 1)); }
-  else if (k === 'k' || e.key === 'ArrowUp') { e.preventDefault(); host.select(Math.max(0, state.selected - 1)); }
+  if (k === 'j' || e.key === 'ArrowDown') { e.preventDefault(); select(Math.min(state.items.length - 1, state.selected + 1)); }
+  else if (k === 'k' || e.key === 'ArrowUp') { e.preventDefault(); select(Math.max(0, state.selected - 1)); }
   else if (e.key === '/') { e.preventDefault(); $('#q').focus(); }
-  else if (e.key === 'Escape') host.stopPreview();
+  else if (e.key === 'Escape') stopPreview();
   else if (!it) return;
-  else if (k === ' ') { e.preventDefault(); host.togglePreview(it); }
+  else if (k === ' ') { e.preventDefault(); togglePreview(it); }
   else if (/^[0-5]$/.test(k)) setRating(Number(k));
   else if (k === 'r') { e.preventDefault(); $('#cardName')?.select(); }
   else if (k === 't') { e.preventDefault(); $('#cardTags')?.focus(); }
   else if (k === 'n') { e.preventDefault(); $('#cardMemo')?.focus(); }
-  else if (k === 'e') host.openPath(it);
-  else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); host.trashSound(it); }
+  else if (k === 'e') openPath(it);
+  else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); trashSound(it); }
 }
 
 /** @type {Record<string, [string, [string, string][]]>} */
-export const SHORTCUTS = {
+const SHORTCUTS = {
   sounds: ['Library', [['J or ↓', 'Next sound'], ['K or ↑', 'Previous sound'], ['Space', 'Play or stop'], ['/', 'Jump to the search box'], ['1 to 5', 'Rate the sound, 0 clears'],
     ['E', 'Open in the editor'], ['R', 'Rename the file'], ['T', 'Edit tags'], ['N', 'Edit the note'], ['Backspace', 'Move to the Trash, after asking'], ['Escape', 'Stop playback']]],
   discover: ['Discover', [['/', 'Jump to the search box'], ['Tab', 'Take the idea being typed'], ['Enter', 'Search'], ['J or ↓', 'Next result'], ['K or ↑', 'Previous result'],

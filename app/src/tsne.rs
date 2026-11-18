@@ -56,8 +56,9 @@ pub fn tsne(x: &[Vec<f32>], init: &[[f64; 2]], perplexity: f64, iters: usize) ->
             nb.iter().zip(p).map(|((j, _), pv)| (*j, pv)).collect()
         })
         .collect();
-    // Symmetric joint probabilities, as sparse rows.
-    let mut rows: Vec<std::collections::HashMap<usize, f64>> = vec![Default::default(); n];
+    // Symmetric joint probabilities, as sparse rows. Each row is kept in order of its points,
+    // so the sums below run in the same order every time.
+    let mut rows: Vec<std::collections::BTreeMap<usize, f64>> = vec![Default::default(); n];
     for (i, r) in cond.iter().enumerate() {
         for &(j, v) in r {
             *rows[i].entry(j).or_default() += v / (2.0 * n as f64);
@@ -111,9 +112,8 @@ pub fn tsne(x: &[Vec<f32>], init: &[[f64; 2]], perplexity: f64, iters: usize) ->
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn separates_two_clusters() {
-        // Two tight groups of unit vectors in different directions must land apart.
+    /// Two tight groups of 20 unit vectors in different directions, and where they start.
+    fn two_clusters() -> (Vec<Vec<f32>>, Vec<[f64; 2]>) {
         let mut x = Vec::new();
         for g in 0..2 {
             for k in 0..20 {
@@ -124,7 +124,18 @@ mod tests {
                 x.push(v.iter().map(|a| a / n).collect());
             }
         }
-        let init: Vec<[f64; 2]> = (0..40).map(|i| [(i as f64 * 0.37).sin() * 1e-4, (i as f64 * 0.71).cos() * 1e-4]).collect();
+        (x, (0..40).map(|i| [(i as f64 * 0.37).sin() * 1e-4, (i as f64 * 0.71).cos() * 1e-4]).collect())
+    }
+
+    #[test]
+    fn the_same_sounds_give_the_same_map() {
+        let (x, init) = two_clusters();
+        assert_eq!(super::tsne(&x, &init, 10.0, 300), super::tsne(&x, &init, 10.0, 300));
+    }
+
+    #[test]
+    fn separates_two_clusters() {
+        let (x, init) = two_clusters();
         let y = super::tsne(&x, &init, 10.0, 500);
         let c = |r: std::ops::Range<usize>| {
             let n = r.len() as f64;
