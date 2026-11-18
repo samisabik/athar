@@ -1,7 +1,3 @@
-# Local leftovers of the retired Python app (old builds, its environment).
-dist/
-.venv/
-
 build/
 .DS_Store
 .claude/
