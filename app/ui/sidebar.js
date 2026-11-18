@@ -60,7 +60,7 @@ async function renderFolders(seq) {
     const pick = () => { folderShut = folderSel === f.path && !folderShut; folderSel = f.path; loadFolders().catch(fail); };
     box.append(focusable(el('div', {
       class: 'item' + (open ? ' on' : '') + (f.offline ? ' offline' : ''),
-      'data-tip': f.offline ? `${f.path} was not found, or its drive is not connected. Its sounds, tags and notes are kept.` : null,
+      'data-tip': f.offline ? `${f.path} was not found, or its drive is not connected. Its sounds, tags and notes are kept.` : f.failed ? failedTip(f) : null,
       onclick: pick,
     },
     el('span', { class: 'label' }, baseOf(f.path)),
@@ -104,8 +104,14 @@ async function appendTree(box, f, path, depth, show) {
 // What a folder is doing, and for the picked one the two things you can do with it.
 /** @param {Folder} f */
 function folderState(f) {
-  const waiting = f.files - f.indexed;
-  return f.offline ? 'not found' : waiting > 0 ? `analysing ${waiting} more` : '';
+  const waiting = f.files - f.indexed - f.failed;
+  return f.offline ? 'not found' : waiting > 0 ? `analysing ${waiting} more` : f.failed ? `${f.failed} could not be read` : '';
+}
+/** Names the folder's files that could not be read, with the reason for each. @param {Folder} f */
+function failedTip(f) {
+  // The decoder's reasons are chains ("reading the container: ...: no suitable format reader found"); the last link says it.
+  const named = f.failed_files.map(x => `${baseOf(x.path)} (${x.error.split(': ').pop()})`), more = f.failed - named.length;
+  return `Could not be read: ${named.join(', ')}${more > 0 ? ` and ${more} more` : ''}`;
 }
 const revealFolder = (/** @type {string} */ path) => lib.revealFolder({ path }).catch(fail);
 /** @param {number} n */

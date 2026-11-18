@@ -32,9 +32,9 @@ pub fn rename_project(lib: Lib, id: i64, req: Value) -> Res<Value> {
 }
 
 #[tauri::command(async)]
-pub fn delete_project(lib: Lib, id: i64) -> Value {
-    lib.delete_project(id);
-    done()
+pub fn delete_project(lib: Lib, id: i64) -> Res<Value> {
+    lib.delete_project(id)?;
+    Ok(done())
 }
 
 /// Adds a library sound to a project, or with `remove` takes it out.
@@ -42,7 +42,7 @@ pub fn delete_project(lib: Lib, id: i64) -> Value {
 pub fn project_item(lib: Lib, id: i64, req: Value) -> Res<Value> {
     let p = s(&req, "path");
     if req["remove"].as_bool().unwrap_or(false) {
-        lib.project_remove(id, p);
+        lib.project_remove(id, p)?;
     } else {
         lib.known_path(p)?;
         lib.project_add(id, p).map_err(|e| format!("Could not copy the sound into the project folder: {e}"))?;
@@ -57,10 +57,10 @@ pub fn project_folder(lib: Lib, id: i64, req: Value) -> Res<Value> {
 }
 
 #[tauri::command(async)]
-pub fn set_project_order(lib: Lib, id: i64, req: Value) -> Value {
+pub fn set_project_order(lib: Lib, id: i64, req: Value) -> Res<Value> {
     let paths: Vec<String> = serde_json::from_value(req["paths"].clone()).unwrap_or_default();
-    lib.set_project_order(id, &paths);
-    done()
+    lib.set_project_order(id, &paths)?;
+    Ok(done())
 }
 
 #[tauri::command(async)]

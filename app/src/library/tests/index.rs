@@ -94,7 +94,7 @@ fn a_missing_folder_is_offline_and_kept() {
     let size = std::fs::metadata(&p).unwrap().len();
     let away = format!("{}-away", l.folder);
     std::fs::rename(&l.folder, &away).unwrap();
-    assert_eq!(l.lib.folder_counts(), json!([{"path": l.folder, "files": 1, "indexed": 1, "bytes": size, "offline": true}]));
+    assert_eq!(l.lib.folder_counts(), json!([{"path": l.folder, "files": 1, "indexed": 1, "bytes": size, "failed": 0, "failed_files": [], "offline": true}]));
     assert!(l.by_name().is_empty());
     assert_eq!(l.count(), 1);
     std::fs::rename(&away, &l.folder).unwrap();

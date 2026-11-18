@@ -36,9 +36,9 @@ pub fn add_folder(lib: Lib, req: Value) -> Res<Value> {
 }
 
 #[tauri::command(async)]
-pub fn remove_folder(lib: Lib, req: Value) -> Value {
-    lib.remove_folder(s(&req, "path"));
-    done()
+pub fn remove_folder(lib: Lib, req: Value) -> Res<Value> {
+    lib.remove_folder(s(&req, "path"))?;
+    Ok(done())
 }
 
 #[tauri::command(async)]

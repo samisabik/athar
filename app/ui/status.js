@@ -3,7 +3,7 @@
 
 import { $ } from './ui.js';
 import { lib } from './native.js';
-import { onOutputError } from './engine.js';
+import { onOutputError, listen } from './engine.js';
 import { state } from './store.js';
 import { baseOf, plural } from './names.js';
 import { search } from './search.js';
@@ -55,15 +55,13 @@ function showStatus(s) {
   wasBusy = busy;
 }
 
-const POLL_MS = 1000, POLL_HIDDEN_MS = 4000;
 /** @type {Status | null} */
 let last = null;
-/** Reads the library's status now and again every second, for as long as the window lives. */
+/** Shows the library's status now, and again whenever the native side says it changed. */
 export async function watchStatus() {
-  try { last = await lib.status(); problems.status = ''; }
-  catch (e) { problems.status = `Could not read the library's status: ${e instanceof Error ? e.message : e}`; }
-  try { if (problems.status) showProblem(); else if (last) showStatus(last); }
-  finally { setTimeout(watchStatus, document.hidden ? POLL_HIDDEN_MS : POLL_MS); }
+  listen('status', (/** @type {Status} */ s) => { last = s; problems.status = ''; showStatus(s); });
+  try { const s = await lib.status(); if (!last) { last = s; showStatus(s); } }
+  catch (e) { problems.status = `Could not read the library's status: ${e instanceof Error ? e.message : e}`; showProblem(); }
 }
 
 // The engine says when the sound output is lost and when it is back.

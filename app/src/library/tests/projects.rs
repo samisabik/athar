@@ -61,7 +61,7 @@ fn project_order_is_kept_and_new_sounds_go_last() {
         l.lib.project_add(pid, p).unwrap();
     }
     assert_eq!(l.lib.project_order(pid), json!([a, b, c]));
-    l.lib.set_project_order(pid, &[c.clone(), a.clone(), b.clone()]);
+    l.lib.set_project_order(pid, &[c.clone(), a.clone(), b.clone()]).unwrap();
     assert_eq!(l.lib.project_order(pid), json!([c, a, b]));
     let d = l.add("0-first-by-name.wav", 9);
     l.lib.project_add(pid, &d).unwrap();
@@ -83,7 +83,7 @@ fn pads_hold_one_sound_each_and_follow_the_project() {
     assert_eq!(l.lib.project_pads(pid), json!({&a: 0, &b: 17}));
     l.lib.set_project_pads(pid, &json!({&b: 5})).unwrap();
     assert_eq!(l.lib.project_pads(pid), json!({&b: 5}));
-    l.lib.project_remove(pid, &b);
+    l.lib.project_remove(pid, &b).unwrap();
     assert_eq!(l.lib.project_pads(pid), json!({}));
 }
 
@@ -123,7 +123,7 @@ fn setting_a_folder_keeps_the_order() {
     let (a, b) = (l.add("a.wav", 1), l.add("b.wav", 2));
     let a = l.lib.project_add(pid, &a).unwrap();
     let b = l.lib.project_add(pid, &b).unwrap();
-    l.lib.set_project_order(pid, &[b, a]);
+    l.lib.set_project_order(pid, &[b, a]).unwrap();
     let kit = l.path("kit");
     std::fs::create_dir(&kit).unwrap();
     l.lib.set_project_folder(pid, &kit).unwrap();
@@ -144,7 +144,7 @@ fn a_folder_made_by_hand_in_the_projects_folder_becomes_a_project() {
     assert_eq!(p["folder"], l.path("projects/by hand"));
     assert_eq!(l.lib.project_paths(p["id"].as_i64().unwrap()), set(&[&inside]));
     // Deleted in the app, it stays deleted although its folder is still on disk.
-    l.lib.delete_project(p["id"].as_i64().unwrap());
+    l.lib.delete_project(p["id"].as_i64().unwrap()).unwrap();
     l.lib.adopt_project_folders();
     assert!(!l.lib.projects().as_array().unwrap().iter().any(|q| q["name"] == "by hand"));
 }

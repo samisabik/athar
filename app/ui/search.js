@@ -17,7 +17,7 @@ import { loadTags, renderCard } from './card.js';
       tags: string[], memo: string, rating: number, origin: string | null, recorded: string | null, category: string | null,
       score: number, text_match: number, peaks: number[], tempo: number | null }} Item */
 /** @typedef {{ id: number, name: string, folder: string | null, n: number, bytes: number }} Project */
-/** A Library folder. @typedef {{ path: string, files: number, indexed: number, bytes: number, offline: boolean }} Folder */
+/** A Library folder. @typedef {{ path: string, files: number, indexed: number, bytes: number, offline: boolean, failed: number, failed_files: { path: string, error: string }[] }} Folder */
 /** A folder inside a Library folder. @typedef {{ path: string, name: string, files: number, nested: boolean }} Sub */
 /** The state the library pages share (store.js).
     @typedef {{ query: string, category: string | null, folder: string | null, under: string | null, project: number | null,
