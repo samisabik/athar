@@ -2,14 +2,20 @@
 //! when it loops. The page sends the arrangement whenever it changes; passes not yet begun use
 //! the new one, and lane levels change at once.
 
-use crate::engine::{Engine, Ev, Link, Sound};
+use crate::engine::{Engine, Ev, Link};
+use crate::sounds::{Sound, Sounds};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// A pass is scheduled this long before it begins.
 const LOOKAHEAD: f64 = 0.25;
+/// Playing starts this long after it is asked for, so every clip is in the engine by then.
+const LEAD: f64 = 0.05;
+/// How many passes keep their nodes; older ones have long ended.
+const PASSES_KEPT: usize = 4;
 const WAVE_BINS: usize = 400;
 const FADE_POINTS: usize = 33;
 
@@ -68,6 +74,7 @@ struct State {
 pub struct Arr {
     st: Arc<Mutex<State>>,
     engine: Arc<Engine>,
+    files: Arc<Sounds>,
 }
 
 fn fade_curve(out: bool) -> Vec<f32> {
@@ -79,19 +86,18 @@ fn fade_curve(out: bool) -> Vec<f32> {
 }
 
 impl Arr {
-    pub fn new(engine: Arc<Engine>) -> Self {
-        Self { st: Arc::new(Mutex::new(State::default())), engine }
+    pub fn new(engine: Arc<Engine>, files: Arc<Sounds>) -> Self {
+        Self { st: Arc::new(Mutex::new(State::default())), engine, files }
     }
 
-    /// Decodes a clip's file once and keeps it while the Arranger uses it. Returns its length and
-    /// the loudest sample of each of WAVE_BINS stretches, for drawing.
+    /// Takes a clip's file and keeps it while the Arranger uses it. Returns its length and the
+    /// loudest sample of each of WAVE_BINS stretches, for drawing.
     pub fn load(&self, path: &str) -> Result<Value, String> {
         let held = self.st.lock().unwrap().sounds.get(path).cloned();
         let s = match held {
             Some(s) => s,
             None => {
-                let d = athar_core::decode::decode(std::path::Path::new(path)).map_err(|e| e.to_string())?;
-                let s = Sound::new(d.channels, d.sr);
+                let s = self.files.file(path)?;
                 self.st.lock().unwrap().sounds.insert(path.to_string(), s.clone());
                 s
             }
@@ -106,7 +112,7 @@ impl Arr {
                 }
             }
         }
-        Ok(json!({"duration": n as f64 / s.sr as f64, "sr": s.sr, "channels": s.channels.len(), "peaks": peaks}))
+        Ok(json!({"duration": s.seconds(), "sr": s.sr, "channels": s.channels.len(), "peaks": peaks}))
     }
 
     /// The arrangement as stored; while playing, lane levels follow at once and the rest from
@@ -114,16 +120,19 @@ impl Arr {
     /// Returns what the page shows of it: whether each lane is heard, how many heard clips have
     /// a sound to mix, and the name of the first lane heard.
     pub fn set(&self, plain: Value) -> Value {
-        self.st.lock().unwrap().plain = plain;
-        let a = self.plan();
-        let st = self.st.lock().unwrap();
-        let lanes = st.plain["lanes"].as_array().cloned().unwrap_or_default();
-        let heard: Vec<bool> = lanes.iter().map(|l| Self::audible(l, &lanes)).collect();
+        let mut st = self.st.lock().unwrap();
+        st.plain = plain;
+        let a = Self::plan(&st);
+        let lanes = Self::lanes(&st.plain);
+        let heard: Vec<bool> = lanes.iter().map(|l| Self::audible(l, lanes)).collect();
         let clips: usize = a.lanes.iter().filter(|l| l.gain > 0.0).map(|l| l.clips.len()).sum();
         let first = lanes.iter().zip(&a.lanes).find(|(_, l)| l.gain > 0.0 && !l.clips.is_empty()).and_then(|(l, _)| l["name"].as_str().map(String::from));
-        drop(st);
-        self.update(a);
+        self.update(&mut st, a);
         json!({"heard": heard, "clips": clips, "first": first})
+    }
+
+    fn lanes(plain: &Value) -> &[Value] {
+        plain["lanes"].as_array().map_or(&[], Vec::as_slice)
     }
 
     /// Whether a lane sounds: not muted, and soloed when any lane is.
@@ -134,14 +143,13 @@ impl Arr {
 
     /// What plays: each lane's level, its clips whose sounds are loaded, and one pass's length
     /// (where the last clip ends).
-    fn plan(&self) -> Arrangement {
-        let st = self.st.lock().unwrap();
-        let lanes = st.plain["lanes"].as_array().cloned().unwrap_or_default();
+    fn plan(st: &State) -> Arrangement {
+        let all = Self::lanes(&st.plain);
         let mut length: f64 = 0.0;
-        let lanes = lanes
+        let lanes = all
             .iter()
             .map(|lane| {
-                let gain = if Self::audible(lane, &lanes) { 10f64.powf(lane["gain"].as_f64().unwrap_or(0.0) / 20.0) as f32 } else { 0.0 };
+                let gain = if Self::audible(lane, all) { 10f64.powf(lane["gain"].as_f64().unwrap_or(0.0) / 20.0) as f32 } else { 0.0 };
                 let clips = lane["clips"]
                     .as_array()
                     .into_iter()
@@ -150,7 +158,7 @@ impl Arr {
                         let path = c["path"].as_str()?.to_string();
                         let s = st.sounds.get(&path)?;
                         let at = c["at"].as_f64().unwrap_or(0.0);
-                        length = length.max(at + s.frames() as f64 / s.sr as f64);
+                        length = length.max(at + s.seconds());
                         Some(Clip { path, at, fade_in: c["in"].as_f64().unwrap_or(0.0), fade_out: c["out"].as_f64().unwrap_or(0.0) })
                     })
                     .collect();
@@ -162,9 +170,17 @@ impl Arr {
 
     /// The clips that are heard, each with its sound and its lane's level, for a mixdown.
     pub fn heard(&self) -> Vec<(Clip, Arc<Sound>, f32)> {
-        let a = self.plan();
         let st = self.st.lock().unwrap();
-        a.lanes.into_iter().filter(|l| l.gain > 0.0).flat_map(|l| l.clips.into_iter().map(move |c| (c, l.gain))).filter_map(|(c, g)| Some((c.clone(), st.sounds.get(&c.path)?.clone(), g))).collect()
+        let a = Self::plan(&st);
+        a.lanes
+            .into_iter()
+            .filter(|l| l.gain > 0.0)
+            .flat_map(|l| l.clips.into_iter().map(move |c| (c, l.gain)))
+            .filter_map(|(c, g)| {
+                let s = st.sounds.get(&c.path)?.clone();
+                Some((c, s, g))
+            })
+            .collect()
     }
 
     /// Lets go of every file no clip uses any more.
@@ -182,7 +198,7 @@ impl Arr {
         for (li, lane) in p.a.lanes.iter().enumerate() {
             for c in &lane.clips {
                 let Some(s) = sounds.get(&c.path) else { continue };
-                let dur = s.frames() as f64 / s.sr as f64;
+                let dur = s.seconds();
                 if c.at + dur <= from {
                     continue;
                 }
@@ -205,13 +221,14 @@ impl Arr {
                 chain.push(Link::Gain(p.lane_nodes[li]));
                 let id = engine.id();
                 let (when, offset) = if c.at >= from { (t0, 0.0) } else { (t, from - c.at) };
-                engine.play(id, s, when, offset, None, None, chain);
-                pass.voices.push(id);
+                if engine.play(id, s, when, offset, None, None, chain).is_ok() {
+                    pass.voices.push(id);
+                }
             }
         }
         p.passes.push(pass);
         p.changed = true;
-        if p.passes.len() > 4 {
+        if p.passes.len() > PASSES_KEPT {
             let old = p.passes.remove(0);
             engine.drop_nodes(old.nodes);
         }
@@ -223,14 +240,23 @@ impl Arr {
     /// starts at.
     pub fn play(&self, from: f64) -> f64 {
         self.stop();
-        let a = self.plan();
         let e = &self.engine;
-        let t = e.now() + 0.05;
+        let (a, sounds) = {
+            let st = self.st.lock().unwrap();
+            (Self::plan(&st), st.sounds.clone())
+        };
+        // Sounds at another rate than the device's are resampled before the start time is set,
+        // and outside the lock, so a long one delays the start instead of cutting into it.
+        for c in a.lanes.iter().flat_map(|l| &l.clips) {
+            if let Some(s) = sounds.get(&c.path) {
+                let _ = e.prepare(s);
+            }
+        }
+        let t = e.now() + LEAD;
         let run = {
             let mut st = self.st.lock().unwrap();
             let mut p = Playing { a, lane_nodes: vec![], passes: vec![], next: 0.0, end: 0.0, changed: false };
-            let sounds = st.sounds.clone();
-            Self::schedule(e, &sounds, &mut p, t, from.max(0.0));
+            Self::schedule(e, &st.sounds, &mut p, t, from.max(0.0));
             st.playing = Some(p);
             st.run += 1;
             st.run
@@ -243,18 +269,19 @@ impl Arr {
                 return;
             }
             let now = engine.now();
-            let sounds = g.sounds.clone();
-            let Some(p) = g.playing.as_mut() else { return };
+            let State { sounds, playing, changes, .. } = &mut *g;
+            let Some(p) = playing.as_mut() else { return };
             if p.a.looped && p.a.length > 0.0 {
                 // A pass that should already have begun, after a stall, begins now instead.
                 if now > p.next - LOOKAHEAD {
-                    let at = p.next.max(now + 0.05);
-                    Self::schedule(&engine, &sounds, p, at, 0.0);
+                    let at = p.next.max(now + LEAD);
+                    Self::schedule(&engine, sounds, p, at, 0.0);
                 }
             } else if now > p.end {
-                let p = g.playing.take().unwrap();
-                g.changes += 1;
-                Self::release(&engine, p);
+                if let Some(p) = playing.take() {
+                    Self::release(&engine, p);
+                }
+                *changes += 1;
                 return;
             }
         });
@@ -271,8 +298,8 @@ impl Arr {
         engine.drop_nodes(p.lane_nodes);
     }
 
-    fn update(&self, a: Arrangement) {
-        let mut st = self.st.lock().unwrap();
+    /// What plays follows a changed arrangement.
+    fn update(&self, st: &mut State, a: Arrangement) {
         let Some(p) = st.playing.as_mut() else { return };
         let now = self.engine.now();
         for (i, id) in p.lane_nodes.iter().enumerate() {
@@ -325,33 +352,27 @@ impl Arr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::{write_tone, Tmp};
 
-    fn tone(dir: &std::path::Path, name: &str, seconds: f64) -> String {
-        let path = dir.join(name);
-        let spec = hound::WavSpec { channels: 1, sample_rate: 8000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
-        let mut w = hound::WavWriter::create(&path, spec).unwrap();
-        for i in 0..(8000.0 * seconds) as usize {
-            w.write_sample(((i as f64 * 0.1).sin() * 8000.0) as i16).unwrap();
-        }
-        w.finalize().unwrap();
-        path.to_string_lossy().into_owned()
-    }
-
-    fn arr() -> (Arr, String, String, tempdir_lite::Dir) {
-        let dir = tempdir_lite::Dir::new();
-        let a = tone(dir.path(), "a.wav", 1.0);
-        let b = tone(dir.path(), "b.wav", 0.5);
-        let arr = Arr::new(Engine::start());
+    fn arr() -> (Arr, String, String, Tmp) {
+        let dir = Tmp::new();
+        let a = write_tone(&dir.0, "a.wav", 8000, 1.0);
+        let b = write_tone(&dir.0, "b.wav", 8000, 0.5);
+        let arr = Arr::new(Engine::silent(), Arc::new(Sounds::default()));
         arr.load(&a).unwrap();
         arr.load(&b).unwrap();
         (arr, a, b, dir)
+    }
+
+    fn plan(arr: &Arr) -> Arrangement {
+        Arr::plan(&arr.st.lock().unwrap())
     }
 
     #[test]
     fn a_pass_ends_where_the_last_clip_does() {
         let (arr, a, b, _d) = arr();
         arr.set(json!({"loop": true, "lanes": [{"gain": 0, "clips": [{"path": a, "at": 0}]}, {"gain": -6, "clips": [{"path": b, "at": 2.0}]}]}));
-        let plan = arr.plan();
+        let plan = plan(&arr);
         assert!((plan.length - 2.5).abs() < 1e-9);
         assert!((plan.lanes[1].gain - 0.501).abs() < 0.001);
     }
@@ -372,7 +393,7 @@ mod tests {
     fn clips_without_a_loaded_sound_are_left_out() {
         let (arr, a, _b, _d) = arr();
         arr.set(json!({"loop": true, "lanes": [{"gain": 0, "clips": [{"path": a, "at": 0}, {"path": "/nowhere.wav", "at": 5.0}]}]}));
-        let plan = arr.plan();
+        let plan = plan(&arr);
         assert_eq!(plan.lanes[0].clips.len(), 1);
         assert!((plan.length - 1.0).abs() < 1e-9);
     }
@@ -388,26 +409,5 @@ mod tests {
         assert_eq!(st["passes"][0], json!([t, 0.25]));
         arr.stop();
         assert_eq!(arr.changed(&mut seen).unwrap()["playing"], false);
-    }
-}
-
-#[cfg(test)]
-mod tempdir_lite {
-    /// A folder for one test's files, removed afterwards.
-    pub struct Dir(std::path::PathBuf);
-    impl Dir {
-        pub fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("athar-test-{}-{:?}", std::process::id(), std::thread::current().id()).replace(['(', ')'], ""));
-            std::fs::create_dir_all(&p).unwrap();
-            Dir(p)
-        }
-        pub fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-    }
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
     }
 }

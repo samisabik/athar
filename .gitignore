@@ -8,4 +8,6 @@ build/
 
 core/target/
 app/target/
+# Written by tauri-build on every build.
+app/gen/
 node_modules/

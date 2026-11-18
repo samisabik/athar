@@ -1,16 +1,20 @@
-//! Checks the Rust core against outputs saved from the former Python engine (tests/reference),
-//! so the vectors stored in existing libraries stay valid.
+//! Checks the core against the files in tests/reference, so the vectors and descriptors stored
+//! in existing libraries stay valid. The .npy files and reference.json are frozen outputs of
+//! the retired Python engine (called "Python" below); they cannot be regenerated, only kept.
+//!
+//! The tests that embed need the model in build/model, which packaging/ builds locally. They
+//! fail when it is absent, unless ATHAR_SKIP_MODEL_TESTS is set.
 
 use athar_core::features::{clap_features, FRAMES, N_MELS};
 use ndarray::ArrayD;
 use ndarray_npy::read_npy;
 use std::path::PathBuf;
 
-pub fn reference(name: &str) -> PathBuf {
+fn reference(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/reference").join(name)
 }
 
-pub const SOUNDS: [&str; 5] = ["kick_44k_mono", "tone_440_48k", "noise_burst_44k", "chirp_stereo_16s", "loop_120bpm_22k"];
+const SOUNDS: [&str; 5] = ["kick_44k_mono", "tone_440_48k", "noise_burst_44k", "chirp_stereo_16s", "loop_120bpm_22k"];
 
 #[test]
 fn features_match_python() {
@@ -33,8 +37,14 @@ fn features_match_python() {
     }
 }
 
-fn model_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/model")
+fn model() -> Option<athar_core::embed::Clap> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../build/model");
+    if !dir.join("audio.onnx").exists() {
+        // A missing model must not read as a pass, so skipping is asked for by name.
+        assert!(std::env::var_os("ATHAR_SKIP_MODEL_TESTS").is_some(), "no model in {}: run packaging/export_model.py, or set ATHAR_SKIP_MODEL_TESTS", dir.display());
+        return None;
+    }
+    Some(athar_core::embed::Clap::load(&dir).unwrap())
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -43,7 +53,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn embeddings_match_python() {
-    let clap = athar_core::embed::Clap::load(&model_dir()).unwrap();
+    let Some(clap) = model() else { return };
     for name in SOUNDS {
         let y: ndarray::Array1<f32> = read_npy(reference(&format!("{name}.load48k.npy"))).unwrap();
         if y.len() > 15 * 48_000 {
@@ -86,7 +96,7 @@ fn snr_below(got: &[f32], want: &[f32], hz: f64) -> f64 {
 #[test]
 fn files_match_python() {
     use athar_core::decode::{clips, decode, load_audio};
-    let clap = athar_core::embed::Clap::load(&model_dir()).unwrap();
+    let clap = model();
     let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(reference("reference.json")).unwrap()).unwrap();
     for name in SOUNDS {
         let info = &index["files"][name];
@@ -100,12 +110,15 @@ fn files_match_python() {
         let snr = snr_below(&y, want.as_slice().unwrap(), 0.9 * d.sr.min(48_000) as f64 / 2.0);
         let c = clips(&d, &y).unwrap();
         assert_eq!(c.len() as u64, info["clips"].as_u64().unwrap(), "{name}: clips");
-        let got = clap.embed_sound(&c).unwrap();
-        let emb: ndarray::Array1<f32> = read_npy(reference(&format!("{name}.embedding.npy"))).unwrap();
-        let cos = cosine(&got, emb.as_slice().unwrap());
-        println!("{name}: 48 kHz audio {snr:.1} dB from Python's below 90% of Nyquist, embedding cosine {cos:.6}");
+        println!("{name}: 48 kHz audio {snr:.1} dB from Python's below 90% of Nyquist");
         assert!(snr > 60.0, "{name}: 48 kHz audio only {snr} dB from Python's");
-        assert!(cos > 0.9999, "{name}: cosine {cos}");
+        if let Some(clap) = &clap {
+            let got = clap.embed_sound(&c).unwrap();
+            let emb: ndarray::Array1<f32> = read_npy(reference(&format!("{name}.embedding.npy"))).unwrap();
+            let cos = cosine(&got, emb.as_slice().unwrap());
+            println!("{name}: embedding cosine {cos:.6}");
+            assert!(cos > 0.9999, "{name}: cosine {cos}");
+        }
     }
 }
 

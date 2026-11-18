@@ -1,64 +1,42 @@
 //! The audio engine: plays sounds through CoreAudio (via cpal) on a clock of its own.
 //!
-//! The page describes what to play as a small graph, the way WebAudio does: a sound starts at a
-//! time on the engine clock and passes through a chain of nodes (gains with automation, EQ
-//! filters, a spectrum tap) to the output. The audio thread only ever reads commands from a
-//! channel; sounds arrive already resampled to the device rate.
+//! A sound starts at a time on the engine clock and passes through a chain of nodes (gains with
+//! automation, EQ filters, a spectrum tap) to the output. The editor and the Arranger build the
+//! chains; the page only asks for a sound by its key.
+//!
+//! The output callback owns the graph. Other threads reach it through a channel of commands and
+//! read what it publishes without a lock: the clock, the output level, the tap and the ids of
+//! sounds that ended. Sounds arrive already at the device rate, and what the callback is done
+//! with (voices, replaced automation) goes to another thread to be freed.
 
-use athar_core::decode::resample;
+use crate::sounds::{Channels, Sound};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::time::Duration;
 
+/// Samples of the tap the spectrum is taken from.
 const TAP: usize = 4096;
-
-/// A sound held in memory, one vector per channel, with copies resampled to the device rate.
-pub struct Sound {
-    pub channels: Vec<Vec<f32>>,
-    pub sr: u32,
-    at_rate: Mutex<Option<(u32, Arc<Vec<Vec<f32>>>)>>,
-}
-
-impl Sound {
-    pub fn new(channels: Vec<Vec<f32>>, sr: u32) -> Arc<Self> {
-        Arc::new(Self { channels, sr, at_rate: Mutex::new(None) })
-    }
-
-    pub fn frames(&self) -> usize {
-        self.channels.first().map_or(0, Vec::len)
-    }
-
-    fn at(&self, rate: u32) -> Arc<Vec<Vec<f32>>> {
-        let mut c = self.at_rate.lock().unwrap();
-        if let Some((r, d)) = c.as_ref() {
-            if *r == rate {
-                return d.clone();
-            }
-        }
-        let d: Vec<Vec<f32>> = if self.sr == rate {
-            self.channels.clone()
-        } else {
-            self.channels.iter().map(|ch| resample(ch, self.sr, rate).unwrap_or_default()).collect()
-        };
-        let d = Arc::new(d);
-        *c = Some((rate, d.clone()));
-        d
-    }
-}
+/// Room made ahead of time, so the callback seldom has to ask for memory.
+const VOICES: usize = 256;
+const NODES: usize = 1024;
+const BLOCK: usize = 8192;
+/// Ended sounds and freed memory waiting for their readers.
+const ENDED: usize = 4096;
+const GARBAGE: usize = 4096;
 
 /// One step of a gain node's automation, in seconds of the engine clock.
-#[derive(Clone, Debug, serde::Deserialize)]
-#[serde(tag = "k")]
+#[derive(Clone, Debug)]
 pub enum Ev {
-    #[serde(rename = "set")]
+    /// Jumps to `v` at `t`.
     Set { t: f64, v: f32 },
-    #[serde(rename = "ramp")]
+    /// Arrives at `v` at `t` in a straight line from the event before it.
     Ramp { t: f64, v: f32 },
-    #[serde(rename = "target")]
+    /// From `t`, approaches `v` exponentially with time constant `tau`.
     Target { t: f64, v: f32, tau: f64 },
-    #[serde(rename = "curve")]
+    /// From `t`, runs through `values` over `dur` seconds.
     Curve { t: f64, dur: f64, values: Vec<f32> },
 }
 
@@ -77,7 +55,6 @@ struct Gain {
 }
 
 impl Gain {
-    /// The value at time t, as WebAudio's AudioParam computes it for these event kinds.
     fn at(&self, t: f64) -> f32 {
         let mut v = self.value;
         let mut vt = 0.0f64;
@@ -120,18 +97,13 @@ impl Gain {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Coefs {
-    b0: f32,
-    b1: f32,
-    b2: f32,
-    a1: f32,
-    a2: f32,
-}
+/// A biquad filter's coefficients b0, b1, b2, a1, a2, with a0 divided out.
+pub type Coefs = [f32; 5];
 
-/// WebAudio BiquadFilterNode coefficients (Audio EQ Cookbook, with WebAudio's reading of Q:
-/// in dB for low- and high-pass, linear for peaking and notch, unused by shelves).
-pub fn biquad(kind: &str, f: f64, q: f64, gain_db: f64, rate: f64) -> Option<[f32; 5]> {
+/// Audio EQ Cookbook coefficients, reading Q as WebAudio's BiquadFilterNode does (in dB for
+/// low- and high-pass, linear for peaking and notch, unused by shelves), which the EQ's Q
+/// values were chosen for.
+pub fn biquad(kind: &str, f: f64, q: f64, gain_db: f64, rate: f64) -> Option<Coefs> {
     let w0 = 2.0 * std::f64::consts::PI * (f / rate).clamp(0.0, 0.5);
     let (sn, cs) = (w0.sin(), w0.cos());
     let a = 10f64.powf(gain_db / 40.0);
@@ -177,89 +149,164 @@ pub fn biquad(kind: &str, f: f64, q: f64, gain_db: f64, rate: f64) -> Option<[f3
     Some([(b0 / a0) as f32, (b1 / a0) as f32, (b2 / a0) as f32, (a1 / a0) as f32, (a2 / a0) as f32])
 }
 
-#[derive(Clone, Copy, Debug, serde::Deserialize)]
-#[serde(tag = "k", content = "id")]
+
+/// One node of a voice's chain.
+#[derive(Clone, Copy, Debug)]
 pub enum Link {
-    #[serde(rename = "gain")]
     Gain(u64),
-    #[serde(rename = "filter")]
     Filter(u64),
-    #[serde(rename = "tap")]
+    Tap,
+}
+
+/// A link as one block runs it, looked up in the graph once before the block.
+#[derive(Clone, Copy)]
+enum Step {
+    Skip,
+    /// The gain at the two ends of the block, interpolated across it.
+    Gain(f32, f32),
+    /// The coefficients, and which of the voice's filter states they run on.
+    Filter(Coefs, usize),
     Tap,
 }
 
 struct Voice {
     id: u64,
-    data: Arc<Vec<Vec<f32>>>,
+    /// The device rate `data` was made for.
+    rate: u32,
+    data: Channels,
     start: u64,
     pos: usize,
     end: usize,
     looped: Option<(usize, usize)>,
     stop_at: Option<u64>,
     chain: Vec<Link>,
+    steps: Vec<Step>,
+    /// Per filter link and channel: the last two inputs and outputs.
     filt: Vec<[f32; 4]>,
 }
 
 enum Cmd {
     Start(Box<Voice>),
-    Stop(u64, u64),
-    GainSet(u64, Gain),
-    Filter(u64, Option<[f32; 5]>),
+    /// A voice and the engine time it stops at.
+    Stop(u64, f64),
+    Gain(u64, Gain),
+    Filter(u64, Option<Coefs>),
     Drop(Vec<u64>),
     StopAll,
 }
 
+/// What the callback is done with, freed on another thread.
+enum Garbage {
+    Voice(Box<Voice>),
+    Gain(Gain),
+    Ids(Vec<u64>),
+}
+
+/// What the callback publishes, read without a lock.
+struct Shared {
+    /// Frames played since the engine started, at the current rate.
+    clock: AtomicU64,
+    level: AtomicU32,
+    volume: AtomicU32,
+    /// The last TAP samples that passed a tap, as f32 bits, and where the next one goes.
+    tap: Vec<AtomicU32>,
+    tap_at: AtomicUsize,
+}
+
+/// Where the callback hands things over to other threads. Neither ever makes it wait.
+struct Outlets {
+    ended: Sender<u64>,
+    garbage: Sender<Garbage>,
+}
+
+impl Outlets {
+    fn free(&self, g: Garbage) {
+        // With no room left it is freed here after all.
+        let _ = self.garbage.try_send(g);
+    }
+}
+
 struct Graph {
-    voices: Vec<Voice>,
+    rate: u32,
+    voices: Vec<Box<Voice>>,
     gains: HashMap<u64, Gain>,
     filters: HashMap<u64, Coefs>,
-    tap: Vec<f32>,
-    tap_at: usize,
+    tap_block: Vec<f32>,
+    /// Ended voices not reported yet, for want of room.
+    unreported: Vec<u64>,
 }
 
 pub struct Engine {
     tx: Sender<Cmd>,
     rate: AtomicU32,
-    clock: Arc<AtomicU64>,
-    level: Arc<AtomicU32>,
-    volume: Arc<AtomicU32>,
+    shared: Arc<Shared>,
     graph: Arc<Mutex<Graph>>,
-    ended: Arc<Mutex<Vec<u64>>>,
+    outlets: Arc<Outlets>,
+    ended: Receiver<u64>,
+    /// Each gain node as last set, for `gain_now`.
+    gains: Mutex<HashMap<u64, Gain>>,
     next: AtomicU64,
     error: Mutex<Option<String>>,
-    sounds: Mutex<HashMap<String, Arc<Sound>>>,
-    order: Mutex<Vec<String>>,
-    uploads: Mutex<Vec<(String, Arc<Sound>)>>,
-    held: Mutex<HashMap<String, Arc<Sound>>>,
 }
 
 impl Engine {
-    pub fn start() -> Arc<Self> {
+    fn new() -> (Arc<Self>, Receiver<Cmd>, Receiver<Garbage>) {
         let (tx, rx) = unbounded();
+        let (ended_tx, ended) = bounded(ENDED);
+        let (garbage_tx, garbage) = bounded(GARBAGE);
+        let rate = 48_000;
         let e = Arc::new(Self {
             tx,
-            rate: AtomicU32::new(48_000),
-            clock: Arc::new(AtomicU64::new(0)),
-            level: Arc::new(AtomicU32::new(0)),
-            volume: Arc::new(AtomicU32::new(0.8f32.to_bits())),
-            graph: Arc::new(Mutex::new(Graph { voices: vec![], gains: HashMap::new(), filters: HashMap::new(), tap: vec![0.0; TAP], tap_at: 0 })),
-            ended: Arc::new(Mutex::new(Vec::new())),
+            rate: AtomicU32::new(rate),
+            shared: Arc::new(Shared {
+                clock: AtomicU64::new(0),
+                level: AtomicU32::new(0),
+                volume: AtomicU32::new(0.8f32.to_bits()),
+                tap: (0..TAP).map(|_| AtomicU32::new(0)).collect(),
+                tap_at: AtomicUsize::new(0),
+            }),
+            graph: Arc::new(Mutex::new(Graph {
+                rate,
+                voices: Vec::with_capacity(VOICES),
+                gains: HashMap::with_capacity(NODES),
+                filters: HashMap::with_capacity(NODES),
+                tap_block: Vec::with_capacity(BLOCK),
+                unreported: Vec::with_capacity(VOICES),
+            })),
+            outlets: Arc::new(Outlets { ended: ended_tx, garbage: garbage_tx }),
+            ended,
+            gains: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
             error: Mutex::new(None),
-            sounds: Mutex::new(HashMap::new()),
-            order: Mutex::new(Vec::new()),
-            uploads: Mutex::new(Vec::new()),
-            held: Mutex::new(HashMap::new()),
         });
+        (e, rx, garbage)
+    }
+
+    pub fn start() -> Arc<Self> {
+        let (e, rx, garbage) = Self::new();
         let me = e.clone();
         std::thread::spawn(move || me.run(rx));
+        std::thread::spawn(move || {
+            for g in garbage {
+                match g {
+                    Garbage::Voice(v) => drop(v),
+                    Garbage::Gain(g) => drop(g),
+                    Garbage::Ids(ids) => drop(ids),
+                }
+            }
+        });
         e
+    }
+
+    /// An engine with no output device: its clock stands still and nothing plays.
+    #[cfg(test)]
+    pub fn silent() -> Arc<Self> {
+        Self::new().0
     }
 
     /// Keeps an output stream open on the current default device, opening a new one when the
     /// device changes or the stream fails. The graph carries over.
     fn run(self: Arc<Self>, rx: Receiver<Cmd>) {
-        let rx = Arc::new(rx);
         loop {
             let (fail_tx, fail_rx) = std::sync::mpsc::channel::<()>();
             let stream = self.open(rx.clone(), fail_tx);
@@ -274,7 +321,7 @@ impl Engine {
             let initial = device_name();
             // Watch for a failed stream or a change of default output device.
             loop {
-                if fail_rx.recv_timeout(std::time::Duration::from_millis(1000)).is_ok() {
+                if fail_rx.recv_timeout(Duration::from_millis(1000)).is_ok() {
                     break;
                 }
                 if stream.is_err() || device_name() != initial {
@@ -282,43 +329,29 @@ impl Engine {
                 }
             }
             drop(stream);
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(200));
         }
     }
 
-    fn open(&self, rx: Arc<Receiver<Cmd>>, fail: std::sync::mpsc::Sender<()>) -> Result<cpal::Stream, String> {
+    fn open(&self, rx: Receiver<Cmd>, fail: std::sync::mpsc::Sender<()>) -> Result<cpal::Stream, String> {
         let device = cpal::default_host().default_output_device().ok_or("No audio output device")?;
         let config = device.default_output_config().map_err(|e| e.to_string())?;
-        let rate = config.sample_rate();
         let channels = config.channels() as usize;
-        let old = self.rate.swap(rate, Ordering::SeqCst);
-        if old != rate {
-            // Sounds already playing were resampled for the old rate; let them go.
-            self.graph.lock().unwrap().voices.clear();
-        }
-        let graph = self.graph.clone();
-        let clock = self.clock.clone();
-        let level = self.level.clone();
-        let volume = self.volume.clone();
-        let ended = self.ended.clone();
-        let sr = rate as f64;
-        let cfg: cpal::StreamConfig = config.into();
+        // No stream is running here, so the graph is free.
+        self.set_rate(&mut self.graph.lock().unwrap_or_else(|e| e.into_inner()), config.sample_rate());
+        let (graph, shared, outlets) = (self.graph.clone(), self.shared.clone(), self.outlets.clone());
         device
             .build_output_stream::<f32, _, _>(
-                cfg,
+                config.into(),
                 move |out: &mut [f32], _| {
-                    let mut g = graph.lock().unwrap();
-                    let frames = out.len() / channels;
-                    let t0 = clock.load(Ordering::Relaxed);
-                    while let Ok(c) = rx.try_recv() {
-                        g.apply(c, t0);
-                    }
-                    g.render(out, channels, t0, sr, &ended);
-                    let vol = f32::from_bits(volume.load(Ordering::Relaxed));
-                    out.iter_mut().for_each(|s| *s *= vol);
-                    let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
-                    level.store(peak.to_bits(), Ordering::Relaxed);
-                    clock.store(t0 + frames as u64, Ordering::Relaxed);
+                    // The graph is held elsewhere only while a stream is being replaced; a block
+                    // that falls in that moment is silent.
+                    let mut g = match graph.try_lock() {
+                        Ok(g) => g,
+                        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                        Err(TryLockError::WouldBlock) => return out.fill(0.0),
+                    };
+                    g.block(&rx, &shared, &outlets, out, channels);
                 },
                 move |_| {
                     let _ = fail.send(());
@@ -328,12 +361,29 @@ impl Engine {
             .map_err(|e| e.to_string())
     }
 
+    /// A new device rate: sounds playing were resampled for the old one, so they end, and the
+    /// clock is counted in the new rate's frames from the same moment.
+    fn set_rate(&self, g: &mut Graph, rate: u32) {
+        if g.rate == rate {
+            return;
+        }
+        for v in g.voices.drain(..) {
+            if self.outlets.ended.try_send(v.id).is_err() {
+                g.unreported.push(v.id);
+            }
+        }
+        let frames = self.shared.clock.load(Ordering::Relaxed);
+        self.shared.clock.store((frames as u128 * rate as u128 / g.rate as u128) as u64, Ordering::Relaxed);
+        g.rate = rate;
+        self.rate.store(rate, Ordering::SeqCst);
+    }
+
     pub fn rate(&self) -> u32 {
         self.rate.load(Ordering::SeqCst)
     }
 
     pub fn now(&self) -> f64 {
-        self.clock.load(Ordering::Relaxed) as f64 / self.rate() as f64
+        self.shared.clock.load(Ordering::Relaxed) as f64 / self.rate() as f64
     }
 
     pub fn error(&self) -> Option<String> {
@@ -342,178 +392,144 @@ impl Engine {
 
     /// The loudest sample of the last block sent to the device.
     pub fn level(&self) -> f32 {
-        f32::from_bits(self.level.load(Ordering::Relaxed))
+        f32::from_bits(self.shared.level.load(Ordering::Relaxed))
     }
 
+    /// The sounds that ended since the last call. Each id is handed out once.
     pub fn take_ended(&self) -> Vec<u64> {
-        std::mem::take(&mut *self.ended.lock().unwrap())
+        self.ended.try_iter().collect()
     }
 
     pub fn id(&self) -> u64 {
         self.next.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// A sound decoded from a file, kept for the next plays of the same file.
-    pub fn sound_of_path(&self, path: &str) -> Result<Arc<Sound>, String> {
-        self.cached(path, || {
-            let d = athar_core::decode::decode(std::path::Path::new(path)).map_err(|e| e.to_string())?;
-            Ok(Sound::new(d.channels, d.sr))
-        })
-    }
-
-    /// The first `max_s` seconds of a file, for previews, with the file's whole length.
-    pub fn preview_of_path(&self, path: &str, max_s: usize) -> Result<(String, f64), String> {
-        let key = format!("cap:{path}");
-        let mut full = 0.0;
-        let s = self.cached(&key, || {
-            let mut d = athar_core::decode::decode(std::path::Path::new(path)).map_err(|e| e.to_string())?;
-            full = d.duration();
-            let n = max_s * d.sr as usize;
-            d.channels.iter_mut().for_each(|c| c.truncate(n));
-            Ok(Sound::new(d.channels, d.sr))
-        })?;
-        if full == 0.0 {
-            full = s.frames() as f64 / s.sr as f64;
-        }
-        Ok((key, full))
-    }
-
-    fn cached(&self, key: &str, make: impl FnOnce() -> Result<Arc<Sound>, String>) -> Result<Arc<Sound>, String> {
-        if let Some(s) = self.sounds.lock().unwrap().get(key) {
-            return Ok(s.clone());
-        }
-        let s = make()?;
-        let mut cache = self.sounds.lock().unwrap();
-        let mut order = self.order.lock().unwrap();
-        if cache.insert(key.to_string(), s.clone()).is_none() {
-            order.push(key.to_string());
-        }
-        if order.len() > 24 {
-            let old = order.remove(0);
-            cache.remove(&old);
-        }
-        Ok(s)
-    }
-
-    /// Sounds decoded for a preview (found sounds); the last few are kept for replays.
-    pub fn upload(&self, sound: Arc<Sound>) -> String {
-        let key = format!("buf:{}", self.id());
-        let mut u = self.uploads.lock().unwrap();
-        u.push((key.clone(), sound));
-        if u.len() > 6 {
-            u.remove(0);
-        }
-        key
-    }
-
-    /// Keeps a sound under a key of its own until `release`: recorded takes.
-    pub fn hold(&self, sound: Arc<Sound>) -> String {
-        let key = format!("held:{}", self.id());
-        self.held.lock().unwrap().insert(key.clone(), sound);
-        key
-    }
-
-    pub fn release(&self, key: &str) {
-        self.held.lock().unwrap().remove(key);
-    }
-
-    pub fn sound(&self, key: &str) -> Result<Arc<Sound>, String> {
-        if let Some(s) = self.held.lock().unwrap().get(key) {
-            return Ok(s.clone());
-        }
-        if let Some(p) = key.strip_prefix("path:") {
-            return self.sound_of_path(p);
-        }
-        if key.starts_with("cap:") {
-            return self.sounds.lock().unwrap().get(key).cloned().ok_or_else(|| "That sound is no longer held".to_string());
-        }
-        self.uploads.lock().unwrap().iter().find(|(k, _)| k == key).map(|(_, s)| s.clone()).ok_or_else(|| "That sound is no longer held".to_string())
-    }
-
     pub fn set_gain(&self, node: u64, value: f32, events: Vec<Ev>) {
         let mut events = events;
         events.sort_by(|a, b| a.time().total_cmp(&b.time()));
-        let _ = self.tx.send(Cmd::GainSet(node, Gain { value, events }));
+        let gain = Gain { value, events };
+        self.gains.lock().unwrap().insert(node, gain.clone());
+        let _ = self.tx.send(Cmd::Gain(node, gain));
     }
 
-    pub fn set_filter_coefs(&self, node: u64, c: Option<[f32; 5]>) {
+    pub fn set_filter_coefs(&self, node: u64, c: Option<Coefs>) {
         let _ = self.tx.send(Cmd::Filter(node, c));
     }
 
     /// A gain node's value now, as last set.
     pub fn gain_now(&self, node: u64) -> Option<f32> {
         let t = self.now();
-        self.graph.lock().unwrap().gains.get(&node).map(|g| g.at(t))
+        self.gains.lock().unwrap().get(&node).map(|g| g.at(t))
     }
 
     /// The level of everything played, 0 to 1.
     pub fn set_volume(&self, v: f32) {
-        self.volume.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        self.shared.volume.store(v.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 
     pub fn drop_nodes(&self, ids: Vec<u64>) {
+        self.gains.lock().unwrap().retain(|id, _| !ids.contains(id));
         let _ = self.tx.send(Cmd::Drop(ids));
+    }
+
+    /// Makes `sound` ready to play at the device rate, which takes a while for a long sound at
+    /// another rate. `play` does it too; doing it first keeps a start time from slipping by.
+    pub fn prepare(&self, sound: &Sound) -> Result<(), String> {
+        sound.at(self.rate()).map(|_| ())
     }
 
     /// Plays `sound` from `offset` seconds, at `when` on the engine clock (now if in the past),
     /// for `duration` seconds or to the end, looping between `looped` (seconds) when given.
-    pub fn play(&self, id: u64, sound: &Sound, when: f64, offset: f64, duration: Option<f64>, looped: Option<(f64, f64)>, chain: Vec<Link>) {
+    pub fn play(&self, id: u64, sound: &Sound, when: f64, offset: f64, duration: Option<f64>, looped: Option<(f64, f64)>, chain: Vec<Link>) -> Result<(), String> {
         let rate = self.rate();
-        let data = sound.at(rate);
-        let n = data.first().map_or(0, Vec::len);
+        let data = sound.at(rate)?;
+        let n = data.iter().map(Vec::len).min().unwrap_or(0);
         let r = rate as f64;
         let pos = ((offset.max(0.0) * r) as usize).min(n);
         let end = duration.map_or(n, |d| (pos + (d.max(0.0) * r) as usize).min(n));
         let looped = looped.map(|(a, b)| ((a.max(0.0) * r) as usize, ((b * r) as usize).min(n))).filter(|(a, b)| b > a);
-        let start = ((when * r).max(0.0)) as u64;
         let _ = self.tx.send(Cmd::Start(Box::new(Voice {
             id,
+            rate,
             data,
-            start,
+            start: ((when * r).max(0.0)) as u64,
             pos,
             end: if looped.is_some() { n } else { end },
             looped,
             stop_at: None,
+            steps: Vec::with_capacity(chain.len()),
             filt: vec![[0.0; 4]; chain.iter().filter(|l| matches!(l, Link::Filter(_))).count() * 2],
             chain,
         })));
+        Ok(())
     }
 
     /// Silences everything at once and forgets every gain and filter.
     pub fn stop_all(&self) {
+        self.gains.lock().unwrap().clear();
         let _ = self.tx.send(Cmd::StopAll);
     }
 
+    /// Stops a voice at `when` on the engine clock (now if in the past).
     pub fn stop(&self, id: u64, when: f64) {
-        let _ = self.tx.send(Cmd::Stop(id, ((when * self.rate() as f64).max(0.0)) as u64));
+        let _ = self.tx.send(Cmd::Stop(id, when));
     }
 
-    /// The spectrum at the tap, in dB per bin, the way an AnalyserNode with fftSize 4096
-    /// reports it (Blackman window).
+    /// The spectrum at the tap, in dB per bin: TAP samples under a Blackman window.
     pub fn spectrum(&self) -> Vec<f32> {
-        let (tap, at) = {
-            let g = self.graph.lock().unwrap();
-            (g.tap.clone(), g.tap_at)
-        };
-        let n = TAP;
-        let mut buf: Vec<f64> = (0..n)
-            .map(|i| {
-                let x = tap[(at + i) % n] as f64;
-                let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos() + 0.08 * (4.0 * std::f64::consts::PI * i as f64 / n as f64).cos();
-                x * w
-            })
-            .collect();
-        let fft = realfft::RealFftPlanner::<f64>::new().plan_fft_forward(n);
+        static PLAN: OnceLock<(Arc<dyn realfft::RealToComplex<f64>>, Vec<f64>)> = OnceLock::new();
+        let (fft, window) = PLAN.get_or_init(|| {
+            let turn = |i: usize, k: f64| (k * std::f64::consts::PI * i as f64 / TAP as f64).cos();
+            (realfft::RealFftPlanner::<f64>::new().plan_fft_forward(TAP), (0..TAP).map(|i| 0.42 - 0.5 * turn(i, 2.0) + 0.08 * turn(i, 4.0)).collect())
+        });
+        let at = self.shared.tap_at.load(Ordering::Relaxed);
+        let mut buf: Vec<f64> = window.iter().enumerate().map(|(i, w)| f32::from_bits(self.shared.tap[(at + i) % TAP].load(Ordering::Relaxed)) as f64 * w).collect();
         let mut spec = fft.make_output_vec();
         let _ = fft.process(&mut buf, &mut spec);
-        spec.iter().take(n / 2).map(|c| (20.0 * (c.norm() / n as f64).max(1e-12).log10()) as f32).collect()
+        spec.iter().take(TAP / 2).map(|c| (20.0 * (c.norm() / TAP as f64).max(1e-12).log10()) as f32).collect()
     }
 }
 
 impl Graph {
-    fn apply(&mut self, c: Cmd, now: u64) {
+    /// One block of output: takes the commands that arrived, renders, and publishes the clock,
+    /// the level and the tap.
+    fn block(&mut self, rx: &Receiver<Cmd>, shared: &Shared, outlets: &Outlets, out: &mut [f32], channels: usize) {
+        let frames = out.len() / channels;
+        let t0 = shared.clock.load(Ordering::Relaxed);
+        while let Ok(c) = rx.try_recv() {
+            self.apply(c, t0, outlets);
+        }
+        self.render(out, channels, t0, outlets);
+        let mut at = shared.tap_at.load(Ordering::Relaxed);
+        for x in &self.tap_block {
+            shared.tap[at].store(x.to_bits(), Ordering::Relaxed);
+            at = (at + 1) % TAP;
+        }
+        shared.tap_at.store(at, Ordering::Relaxed);
+        let vol = f32::from_bits(shared.volume.load(Ordering::Relaxed));
+        out.iter_mut().for_each(|s| *s *= vol);
+        let peak = out.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        shared.level.store(peak.to_bits(), Ordering::Relaxed);
+        shared.clock.store(t0 + frames as u64, Ordering::Relaxed);
+    }
+
+    fn end(&mut self, v: Box<Voice>, outlets: &Outlets) {
+        if outlets.ended.try_send(v.id).is_err() {
+            self.unreported.push(v.id);
+        }
+        outlets.free(Garbage::Voice(v));
+    }
+
+    fn apply(&mut self, c: Cmd, now: u64, outlets: &Outlets) {
         match c {
             Cmd::Start(mut v) => {
+                if let Some(i) = self.voices.iter().position(|x| x.id == v.id) {
+                    outlets.free(Garbage::Voice(self.voices.swap_remove(i)));
+                }
+                // Made for a device rate that has changed since: it cannot play.
+                if v.rate != self.rate {
+                    return self.end(v, outlets);
+                }
                 // A sound that should have started already starts where it would be by now, so
                 // the page's playhead and the sound agree.
                 if v.start < now {
@@ -527,124 +543,136 @@ impl Graph {
                         _ => v.pos += late,
                     }
                 }
-                self.voices.retain(|x| x.id != v.id);
-                self.voices.push(*v);
+                self.voices.push(v);
             }
-            Cmd::Stop(id, at) => {
+            Cmd::Stop(id, when) => {
+                let at = (when * self.rate as f64).max(0.0) as u64;
                 for v in self.voices.iter_mut().filter(|v| v.id == id) {
                     v.stop_at = Some(at);
                 }
             }
-            Cmd::GainSet(id, g) => {
-                self.gains.insert(id, g);
+            Cmd::Gain(id, g) => {
+                if let Some(old) = self.gains.insert(id, g) {
+                    outlets.free(Garbage::Gain(old));
+                }
             }
             Cmd::Filter(id, c) => {
                 match c {
-                    Some([b0, b1, b2, a1, a2]) => self.filters.insert(id, Coefs { b0, b1, b2, a1, a2 }),
+                    Some(c) => self.filters.insert(id, c),
                     None => self.filters.remove(&id),
                 };
             }
             Cmd::Drop(ids) => {
-                for id in ids {
-                    self.gains.remove(&id);
-                    self.filters.remove(&id);
+                for id in &ids {
+                    if let Some(old) = self.gains.remove(id) {
+                        outlets.free(Garbage::Gain(old));
+                    }
+                    self.filters.remove(id);
                 }
+                outlets.free(Garbage::Ids(ids));
             }
             Cmd::StopAll => {
-                self.voices.clear();
-                self.gains.clear();
+                // Stopped by request, so not reported as ended.
+                while let Some(v) = self.voices.pop() {
+                    outlets.free(Garbage::Voice(v));
+                }
+                for (_, g) in self.gains.drain() {
+                    outlets.free(Garbage::Gain(g));
+                }
                 self.filters.clear();
             }
         }
     }
 
-    fn render(&mut self, out: &mut [f32], channels: usize, t0: u64, sr: f64, ended: &Mutex<Vec<u64>>) {
-        out.iter_mut().for_each(|s| *s = 0.0);
+    fn render(&mut self, out: &mut [f32], channels: usize, t0: u64, outlets: &Outlets) {
+        out.fill(0.0);
         let frames = out.len() / channels;
-        let (ta, tb) = (t0 as f64 / sr, (t0 + frames as u64) as f64 / sr);
-        let mut done = Vec::new();
-        let mut tap_block = vec![0.0f32; frames];
-        let mut tapped = false;
-        for v in self.voices.iter_mut() {
-            let chans = v.data.len();
-            if chans == 0 {
-                done.push(v.id);
+        let sr = self.rate as f64;
+        let span = (t0 as f64 / sr, (t0 + frames as u64) as f64 / sr);
+        self.tap_block.clear();
+        self.tap_block.resize(frames, 0.0);
+        self.unreported.retain(|id| outlets.ended.try_send(*id).is_err());
+        let mut i = 0;
+        while i < self.voices.len() {
+            let Graph { voices, gains, filters, tap_block, .. } = self;
+            if voices[i].render(out, channels, t0, span, gains, filters, tap_block) {
+                i += 1;
+            } else {
+                let v = self.voices.swap_remove(i);
+                self.end(v, outlets);
+            }
+        }
+    }
+}
+
+impl Voice {
+    /// Adds this voice's part of the block that starts at frame `t0` and spans the engine times
+    /// `span` to `out` and, past a tap, to `tap`. False once the voice has ended.
+    fn render(&mut self, out: &mut [f32], channels: usize, t0: u64, span: (f64, f64), gains: &HashMap<u64, Gain>, filters: &HashMap<u64, Coefs>, tap: &mut [f32]) -> bool {
+        if self.data.is_empty() {
+            return false;
+        }
+        self.steps.clear();
+        let mut states = 0;
+        for link in &self.chain {
+            self.steps.push(match link {
+                Link::Gain(id) => gains.get(id).map_or(Step::Skip, |g| Step::Gain(g.at(span.0), g.at(span.1))),
+                Link::Filter(id) => {
+                    states += 1;
+                    filters.get(id).map_or(Step::Skip, |c| Step::Filter(*c, states - 1))
+                }
+                Link::Tap => Step::Tap,
+            });
+        }
+        let frames = tap.len();
+        let stereo = self.data.len() > 1;
+        for i in 0..frames {
+            let now = t0 + i as u64;
+            if now < self.start {
                 continue;
             }
-            // Gains at the two ends of the block, interpolated across it.
-            let gains: Vec<Option<(f32, f32)>> = v.chain.iter().map(|l| if let Link::Gain(id) = l { self.gains.get(id).map(|g| (g.at(ta), g.at(tb))) } else { None }).collect();
-            let mut finished = false;
-            for i in 0..frames {
-                let now = t0 + i as u64;
-                if now < v.start {
-                    continue;
-                }
-                if v.stop_at.is_some_and(|s| now >= s) || v.pos >= v.end {
-                    finished = true;
-                    break;
-                }
-                let mut l = v.data[0][v.pos];
-                let mut r = if chans > 1 { v.data[1][v.pos] } else { l };
-                let frac = i as f32 / frames as f32;
-                let mut fi = 0;
-                for (k, link) in v.chain.iter().enumerate() {
-                    match link {
-                        Link::Gain(_) => {
-                            if let Some((a, b)) = gains[k] {
-                                let g = a + (b - a) * frac;
-                                l *= g;
-                                r *= g;
-                            }
-                        }
-                        Link::Filter(id) => {
-                            if let Some(c) = self.filters.get(id) {
-                                for (ch, x) in [&mut l, &mut r].into_iter().enumerate() {
-                                    let st = &mut v.filt[fi * 2 + ch];
-                                    let y = c.b0 * *x + c.b1 * st[0] + c.b2 * st[1] - c.a1 * st[2] - c.a2 * st[3];
-                                    st[1] = st[0];
-                                    st[0] = *x;
-                                    st[3] = st[2];
-                                    st[2] = y;
-                                    *x = y;
-                                }
-                            }
-                            fi += 1;
-                        }
-                        Link::Tap => {
-                            tap_block[i] += 0.5 * (l + r);
-                            tapped = true;
+            if self.stop_at.is_some_and(|s| now >= s) || self.pos >= self.end {
+                return false;
+            }
+            let mut l = self.data[0][self.pos];
+            let mut r = if stereo { self.data[1][self.pos] } else { l };
+            let frac = i as f32 / frames as f32;
+            for step in &self.steps {
+                match *step {
+                    Step::Skip => {}
+                    Step::Gain(a, b) => {
+                        let g = a + (b - a) * frac;
+                        l *= g;
+                        r *= g;
+                    }
+                    Step::Filter([b0, b1, b2, a1, a2], k) => {
+                        for (ch, x) in [&mut l, &mut r].into_iter().enumerate() {
+                            let st = &mut self.filt[k * 2 + ch];
+                            let y = b0 * *x + b1 * st[0] + b2 * st[1] - a1 * st[2] - a2 * st[3];
+                            st[1] = st[0];
+                            st[0] = *x;
+                            st[3] = st[2];
+                            st[2] = y;
+                            *x = y;
                         }
                     }
-                }
-                if channels == 1 {
-                    out[i] += 0.5 * (l + r);
-                } else {
-                    out[i * channels] += l;
-                    out[i * channels + 1] += r;
-                }
-                v.pos += 1;
-                if let Some((a, b)) = v.looped {
-                    if v.pos >= b {
-                        v.pos = a;
-                    }
+                    Step::Tap => tap[i] += 0.5 * (l + r),
                 }
             }
-            if finished {
-                done.push(v.id);
+            if channels == 1 {
+                out[i] += 0.5 * (l + r);
+            } else {
+                out[i * channels] += l;
+                out[i * channels + 1] += r;
+            }
+            self.pos += 1;
+            if let Some((a, b)) = self.looped {
+                if self.pos >= b {
+                    self.pos = a;
+                }
             }
         }
-        if tapped {
-            for x in tap_block {
-                self.tap[self.tap_at] = x;
-                self.tap_at = (self.tap_at + 1) % TAP;
-            }
-        }
-        if !done.is_empty() {
-            self.voices.retain(|v| !done.contains(&v.id));
-            if let Ok(mut e) = ended.try_lock() {
-                e.extend(done);
-            }
-        }
+        true
     }
 }
 
@@ -652,8 +680,15 @@ impl Graph {
 mod tests {
     use super::*;
 
+    /// Runs the output callback's work for one mono block.
+    fn pump(e: &Engine, rx: &Receiver<Cmd>, frames: usize) -> Vec<f32> {
+        let mut out = vec![0.0; frames];
+        e.graph.lock().unwrap().block(rx, &e.shared, &e.outlets, &mut out, 1);
+        out
+    }
+
     #[test]
-    fn automation_follows_webaudio() {
+    fn automation_jumps_ramps_follows_curves_and_approaches_targets() {
         let g = Gain { value: 1.0, events: vec![Ev::Set { t: 1.0, v: 0.0 }, Ev::Ramp { t: 2.0, v: 1.0 }] };
         assert_eq!(g.at(0.5), 1.0);
         assert_eq!(g.at(1.0), 0.0);
@@ -667,20 +702,77 @@ mod tests {
 
     #[test]
     fn peaking_filter_has_the_set_gain_at_its_centre() {
-        let [b0, b1, b2, a1, a2] = biquad("peaking", 1000.0, 1.0, 6.0, 48_000.0).unwrap();
+        let [b0, b1, b2, a1, a2] = biquad("peaking", 1000.0, 1.0, 6.0, 48_000.0).unwrap().map(f64::from);
+        // The response at z = e^(jw): real and imaginary parts of numerator and denominator.
         let w = 2.0 * std::f64::consts::PI * 1000.0 / 48_000.0;
-        let z1 = num_complex(w);
-        let h = |b: [f64; 3], a: [f64; 3]| {
-            let num = (b[0] + b[1] * z1.0 + b[2] * z1.1, b[1] * z1.2 + b[2] * z1.3);
-            let den = (1.0 + a[1] * z1.0 + a[2] * z1.1, a[1] * z1.2 + a[2] * z1.3);
-            ((num.0 * num.0 + num.1 * num.1) / (den.0 * den.0 + den.1 * den.1)).sqrt()
-        };
-        let mag = h([b0 as f64, b1 as f64, b2 as f64], [1.0, a1 as f64, a2 as f64]);
-        assert!((20.0 * mag.log10() - 6.0).abs() < 0.01, "{}", 20.0 * mag.log10());
+        let (c1, s1, c2, s2) = (w.cos(), -w.sin(), (2.0 * w).cos(), -(2.0 * w).sin());
+        let num = (b0 + b1 * c1 + b2 * c2).hypot(b1 * s1 + b2 * s2);
+        let den = (1.0 + a1 * c1 + a2 * c2).hypot(a1 * s1 + a2 * s2);
+        let db = 20.0 * (num / den).log10();
+        assert!((db - 6.0).abs() < 0.01, "{db}");
     }
 
-    /// cos and sin of -w and -2w, for evaluating a biquad on the unit circle.
-    fn num_complex(w: f64) -> (f64, f64, f64, f64) {
-        ((-w).cos(), (-2.0 * w).cos(), (-w).sin(), (-2.0 * w).sin())
+    #[test]
+    fn a_sound_plays_through_its_chain_and_is_reported_ended_once() {
+        let (e, rx, _garbage) = Engine::new();
+        let half = e.id();
+        e.set_gain(half, 0.5, vec![]);
+        assert_eq!(e.gain_now(half), Some(0.5));
+        e.play(7, &Sound::new(vec![vec![1.0; 100]], 48_000), 0.0, 0.0, None, None, vec![Link::Gain(half), Link::Tap]).unwrap();
+        let out = pump(&e, &rx, 256);
+        assert!(out[..100].iter().all(|x| (*x - 0.5 * 0.8).abs() < 1e-6), "half gain, then the output volume");
+        assert!(out[100..].iter().all(|x| *x == 0.0));
+        assert!((e.level() - 0.4).abs() < 1e-6);
+        assert_eq!(e.take_ended(), vec![7]);
+        assert!(e.take_ended().is_empty());
+        e.play(8, &Sound::new(vec![vec![1.0; TAP]], 48_000), 0.0, 0.0, None, None, vec![Link::Tap]).unwrap();
+        pump(&e, &rx, TAP);
+        assert!(e.spectrum()[0] > -20.0, "the tap heard it");
+        pump(&e, &rx, TAP);
+        assert!(e.spectrum()[0] < -200.0, "and hears silence once nothing plays");
+    }
+
+    #[test]
+    fn a_late_start_begins_where_the_sound_would_be_by_now() {
+        let (e, rx, _garbage) = Engine::new();
+        pump(&e, &rx, 480);
+        let ramp: Vec<f32> = (0..1000).map(|i| i as f32).collect();
+        e.play(1, &Sound::new(vec![ramp], 48_000), 0.0, 0.0, None, None, vec![]).unwrap();
+        assert_eq!(pump(&e, &rx, 4)[0], 480.0 * 0.8);
+    }
+
+    #[test]
+    fn ended_sounds_wait_for_room_to_be_reported() {
+        let (ended, taken) = bounded(1);
+        let (garbage, _freed) = bounded(8);
+        let outlets = Outlets { ended, garbage };
+        let (e, _rx, _garbage) = Engine::new();
+        let mut g = e.graph.lock().unwrap();
+        for id in [1, 2] {
+            let v = Voice { id, rate: g.rate, data: Arc::new(vec![vec![0.0; 1]]), start: 0, pos: 0, end: 1, looped: None, stop_at: None, chain: vec![], steps: vec![], filt: vec![] };
+            g.apply(Cmd::Start(Box::new(v)), 0, &outlets);
+        }
+        let mut out = [0.0; 8];
+        g.render(&mut out, 1, 0, &outlets);
+        assert_eq!(taken.try_iter().collect::<Vec<u64>>(), vec![1]);
+        g.render(&mut out, 1, 8, &outlets);
+        assert_eq!(taken.try_iter().collect::<Vec<u64>>(), vec![2]);
+    }
+
+    #[test]
+    fn a_new_device_rate_keeps_the_clock_and_ends_what_plays() {
+        let (e, rx, _garbage) = Engine::new();
+        e.play(3, &Sound::new(vec![vec![0.0; 96_000]], 48_000), 0.0, 0.0, None, None, vec![]).unwrap();
+        pump(&e, &rx, 48_000);
+        assert_eq!(e.now(), 1.0);
+        e.set_rate(&mut e.graph.lock().unwrap(), 44_100);
+        assert_eq!((e.rate(), e.now()), (44_100, 1.0));
+        assert_eq!(e.take_ended(), vec![3]);
+        // A sound made ready for the old rate that arrives after the change ends at once.
+        let old = Sound::new(vec![vec![0.0; 10]], 44_100);
+        e.play(4, &old, 0.0, 0.0, None, None, vec![]).unwrap();
+        e.set_rate(&mut e.graph.lock().unwrap(), 48_000);
+        pump(&e, &rx, 16);
+        assert_eq!(e.take_ended(), vec![4]);
     }
 }

@@ -115,7 +115,6 @@ name = "athar-core"
 version = "0.1.0"
 dependencies = [
  "ort",
- "rayon",
  "realfft",
  "rubato",
  "serde_json",

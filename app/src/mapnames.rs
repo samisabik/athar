@@ -3,7 +3,7 @@
 //! middle of its sounds, and closer in still a word the file names there share takes its place.
 
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The broad family each kind of sound belongs to, for the names shown zoomed out.
 const FAMILIES: &[(&str, &[&str])] = &[
@@ -44,20 +44,38 @@ struct Point<'a> {
     y: f64,
 }
 
-/// Counts in first-seen order, so ties go to what came first.
-fn bump(counts: &mut Vec<(String, usize)>, key: &str) {
-    match counts.iter_mut().find(|c| c.0 == key) {
-        Some(c) => c.1 += 1,
-        None => counts.push((key.to_string(), 1)),
+/// Values by key in first-seen order, so ties go to what came first.
+struct Ordered<K, V> {
+    index: HashMap<K, usize>,
+    items: Vec<(K, V)>,
+}
+
+impl<K, V> Default for Ordered<K, V> {
+    fn default() -> Self {
+        Self { index: HashMap::new(), items: vec![] }
+    }
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Default> Ordered<K, V> {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn entry(&mut self, key: K) -> &mut V {
+        let i = *self.index.entry(key.clone()).or_insert_with(|| {
+            self.items.push((key, V::default()));
+            self.items.len() - 1
+        });
+        &mut self.items[i].1
     }
 }
 
 /// Words in more than a third of all file names (a pack's own name, say) describe nothing.
 fn common_words(points: &[Point]) -> HashSet<String> {
-    let mut counts = vec![];
+    let mut counts: HashMap<String, usize> = HashMap::new();
     for p in points {
         for w in unique_words(p.name) {
-            bump(&mut counts, &w);
+            *counts.entry(w).or_default() += 1;
         }
     }
     counts.into_iter().filter(|(_, n)| *n as f64 > points.len() as f64 / 3.0).map(|(w, _)| w).collect()
@@ -67,15 +85,15 @@ fn common_words(points: &[Point]) -> HashSet<String> {
 /// name and the words every file has.
 fn shared_word(group: &[&Point], common: &HashSet<String>) -> Option<String> {
     let kind: HashSet<String> = words_of(group[0].category.unwrap_or("")).into_iter().collect();
-    let mut counts = vec![];
+    let mut counts: Ordered<String, usize> = Ordered::new();
     for p in group {
         for w in unique_words(p.name) {
             if !common.contains(&w) && !kind.contains(&w) {
-                bump(&mut counts, &w);
+                *counts.entry(w) += 1;
             }
         }
     }
-    let best = counts.iter().fold(None::<&(String, usize)>, |b, c| if b.is_none_or(|b| c.1 > b.1) { Some(c) } else { b })?;
+    let best = counts.items.iter().fold(None::<&(String, usize)>, |b, c| if b.is_none_or(|b| c.1 > b.1) { Some(c) } else { b })?;
     (best.1 >= 2 && best.1 as f64 >= group.len() as f64 * 0.5).then(|| best.0.clone())
 }
 
@@ -93,26 +111,17 @@ pub fn names(map: &Value, level: u32) -> Value {
     let broad = level == 0;
     let common = if level >= 2 { common_words(&points) } else { HashSet::new() };
     // Squares in first-seen order, each with its groups in first-seen order.
-    let mut cells: Vec<((i64, i64), Vec<(String, Vec<&Point>)>)> = vec![];
+    let mut cells: Ordered<(i64, i64), Ordered<String, Vec<&Point>>> = Ordered::new();
     for p in &points {
         let Some(kind) = p.category else { continue };
         let key = if broad { format!("g:{}", family(kind)) } else { format!("c:{kind}") };
         let id = ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64);
-        let groups = match cells.iter().position(|c| c.0 == id) {
-            Some(i) => &mut cells[i].1,
-            None => {
-                cells.push((id, vec![]));
-                &mut cells.last_mut().unwrap().1
-            }
-        };
-        match groups.iter_mut().find(|g| g.0 == key) {
-            Some(g) => g.1.push(p),
-            None => groups.push((key, vec![p])),
-        }
+        cells.entry(id).entry(key).push(p);
     }
     let least = if broad { 3 } else { 2 };
     let mut all: Vec<(String, String, usize, f64, f64)> = vec![];
-    for (_, groups) in &cells {
+    for (_, groups) in &cells.items {
+        let groups = &groups.items;
         let (key, group) = groups.iter().fold(&groups[0], |b, g| if g.1.len() > b.1.len() { g } else { b });
         if group.len() < least {
             continue;

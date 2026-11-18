@@ -1,9 +1,16 @@
-//! Signal descriptors used for filtering and sorting: a port of `analyze` and `peaks` in
-//! athar/engine.py, and of the librosa functions they call (spectral centroid and flatness,
-//! onset detection, YIN pitch, tempo estimation and beat tracking), with librosa's defaults.
+//! The descriptors the library stores for every file and filters and sorts by: level,
+//! brightness, pitch, tempo, onset count, whether it is a loop, and the waveform overview.
+//!
+//! Libraries indexed by earlier versions (first by a Python engine built on librosa) hold the
+//! same values, so the functions here reproduce librosa's algorithms with librosa's defaults,
+//! down to where it rounds to f32. Do not "improve" a constant or a rounding step: stored
+//! values would stop matching new ones. tests/reference.rs checks them against frozen outputs.
+//!
+//! The editor's detectors in `dsp` are separate and free to differ.
 
 use crate::decode::{resample, Decoded, ANALYSIS_SECONDS};
 use crate::embed::Error;
+use crate::spectrum::hann;
 use realfft::RealFftPlanner;
 
 const SR: f64 = 22_050.0;
@@ -24,10 +31,6 @@ pub struct Analysis {
     pub is_loop: bool,
 }
 
-fn periodic_hann(n: usize) -> Vec<f64> {
-    (0..n).map(|k| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / n as f64).cos()).collect()
-}
-
 /// Magnitude spectra of a centred, zero-padded STFT (n_fft 2048, hop 512, Hann window).
 fn stft_mag(y: &[f64]) -> Vec<Vec<f64>> {
     let half = N_FFT / 2;
@@ -35,7 +38,7 @@ fn stft_mag(y: &[f64]) -> Vec<Vec<f64>> {
     padded.extend_from_slice(y);
     padded.resize(padded.len() + half, 0.0);
     let frames = 1 + (padded.len() - N_FFT) / HOP;
-    let win = periodic_hann(N_FFT);
+    let win = hann(N_FFT, true);
     let fft = RealFftPlanner::<f64>::new().plan_fft_forward(N_FFT);
     let (mut buf, mut spec) = (fft.make_input_vec(), fft.make_output_vec());
     (0..frames)
@@ -54,6 +57,16 @@ fn stft_mag(y: &[f64]) -> Vec<Vec<f64>> {
 
 fn mean(v: &[f64]) -> f64 {
     if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 }
+}
+
+/// The median of values sorted in rising order.
+fn median(sorted: &[f64]) -> Option<f64> {
+    let k = sorted.len();
+    match k {
+        0 => None,
+        _ if k % 2 == 1 => Some(sorted[k / 2]),
+        _ => Some((sorted[k / 2 - 1] + sorted[k / 2]) / 2.0),
+    }
 }
 
 fn spectral_centroid(mags: &[Vec<f64>]) -> f64 {
@@ -216,7 +229,7 @@ fn tempo(env: &[f64]) -> f64 {
     padded.extend_from_slice(env);
     let edge = *env.last().unwrap_or(&0.0);
     padded.extend((0..half).map(|i| edge * (half - i) as f64 / half as f64));
-    let w = periodic_hann(win);
+    let w = hann(win, true);
     let mut tg = vec![0.0; win];
     let mut frame = vec![0.0; win];
     for t in 0..n {
@@ -232,22 +245,14 @@ fn tempo(env: &[f64]) -> f64 {
     }
     tg.iter_mut().for_each(|g| *g /= n.max(1) as f64);
     let bpm = |lag: usize| if lag == 0 { f64::INFINITY } else { 60.0 * SR / (HOP as f64 * lag as f64) };
-    let max_idx = (0..win).find(|&l| bpm(l) < 320.0).unwrap_or(0);
-    (0..win)
-        .filter(|&l| l >= max_idx)
+    // The best lag among those slower than 320 BPM.
+    let first = (0..win).find(|&l| bpm(l) < 320.0).unwrap_or(0);
+    let best = (first..win)
         .map(|l| (l, (1e6 * tg[l]).ln_1p() - 0.5 * (bpm(l).log2() - 120f64.log2()).powi(2)))
         .fold((0, f64::NEG_INFINITY), |b, c| if c.1 > b.1 { c } else { b })
-        .0
-        .max(1)
-        .pipe(bpm)
+        .0;
+    bpm(best.max(1))
 }
-
-trait Pipe: Sized {
-    fn pipe<R>(self, f: impl FnOnce(Self) -> R) -> R {
-        f(self)
-    }
-}
-impl<T> Pipe for T {}
 
 /// librosa.beat.beat_track's dynamic-programming tracker at a fixed tempo, returning beat frames.
 fn beats(env: &[f64], bpm: f64) -> Vec<usize> {
@@ -302,12 +307,8 @@ fn beats(env: &[f64], bpm: f64) -> Vec<usize> {
         .collect();
     let mut peaks: Vec<f64> = (0..n).filter(|&i| is_max[i]).map(|i| cum[i]).collect();
     peaks.sort_by(f64::total_cmp);
-    let median = match peaks.len() {
-        0 => 0.0,
-        k if k % 2 == 1 => peaks[k / 2],
-        k => (peaks[k / 2 - 1] + peaks[k / 2]) / 2.0,
-    };
-    let tail = (0..n).rev().find(|&i| is_max[i] && cum[i] >= 0.5 * median).unwrap_or(n - 1);
+    let typical = median(&peaks).unwrap_or(0.0);
+    let tail = (0..n).rev().find(|&i| is_max[i] && cum[i] >= 0.5 * typical).unwrap_or(n - 1);
     let mut on = vec![false; n];
     let mut b = tail as i64;
     while b >= 0 {
@@ -334,7 +335,9 @@ fn beats(env: &[f64], bpm: f64) -> Vec<usize> {
     (0..n).filter(|&i| on[i]).collect()
 }
 
-/// A tempo written in the name, as the regex `(?<!\d)(\d{2,3})\s*bpm` (any case) finds it.
+/// A tempo written in the name: the first run of two or three digits followed by "bpm" in any
+/// case, with or without a space (the regex `(?<!\d)(\d{2,3})\s*bpm`). That first number
+/// decides: when it is outside 50 to 220 the name gives no tempo, whatever follows.
 fn name_bpm(name: &str) -> Option<f64> {
     let s = name.to_lowercase();
     let b = s.as_bytes();
@@ -358,7 +361,49 @@ fn name_bpm(name: &str) -> Option<f64> {
     None
 }
 
-/// `analyze` in athar/engine.py: y is the first ANALYSIS_SECONDS of the sound at 48 kHz mono.
+/// The pitch of a tonal sound in Hz, from its first second at 22.05 kHz. None for noisy sounds
+/// (spectral flatness of 0.05 or more), for less than 4096 samples, and when the pitch moves by
+/// a semitone or more or leaves 32 to 1900 Hz.
+fn pitch_of(y22: &[f64]) -> Option<f64> {
+    let seg = &y22[..y22.len().min(22_050)];
+    let tonal = seg.len() >= 4096 && spectral_flatness(&stft_mag(seg)) < 0.05;
+    if !tonal {
+        return None;
+    }
+    let f0: Vec<f64> = yin(seg).into_iter().filter(|v| v.is_finite()).collect();
+    let mut sorted = f0.clone();
+    sorted.sort_by(f64::total_cmp);
+    let pitch = median(&sorted)?;
+    let midi: Vec<f64> = f0.iter().map(|&f| hz_to_midi(f)).collect();
+    let centre = mean(&midi);
+    let spread = (midi.iter().map(|v| (v - centre).powi(2)).sum::<f64>() / midi.len() as f64).sqrt();
+    (pitch > 32.0 && pitch < 1900.0 && spread < 1.0).then_some(pitch)
+}
+
+/// The tempo of a loop, from its onset envelope and length. A loop is cut to a whole number of
+/// beats, so its length implies a tempo; it is accepted only when the sound has a clear pulse
+/// and that tempo is within 4% of the detected one, or of twice or half of it.
+fn loop_tempo(env: &[f64], duration: f64) -> Option<f64> {
+    let detected = tempo(env);
+    let b = beats(env, detected);
+    // How much stronger the onsets on the beats are than the average.
+    let pulse = if b.len() >= 4 { mean(&b.iter().map(|&i| env[i]).collect::<Vec<_>>()) / (mean(env) + 1e-9) } else { 0.0 };
+    if !(pulse > 2.0 && detected > 0.0) {
+        return None;
+    }
+    let implied = [1.0, 2.0, 0.5].iter().find_map(|k| {
+        let want = detected * k;
+        [4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0]
+            .iter()
+            .map(|count| count * 60.0 / duration)
+            .filter(|&c| (60.0..=200.0).contains(&c) && (c - want).abs() / c < 0.04)
+            .min_by(|a, b| (a - want).abs().total_cmp(&(b - want).abs()))
+    })?;
+    Some((implied * 100.0).round() / 100.0)
+}
+
+/// The descriptors of one file. `y48` is its first ANALYSIS_SECONDS at 48 kHz mono, `duration`
+/// its whole length in seconds; `name` can state a tempo ("... 120bpm") or say "loop".
 pub fn analyze(y48: &[f32], duration: f64, name: &str) -> Result<Analysis, Error> {
     let peak = y48.iter().map(|v| v.abs() as f64).fold(0.0, f64::max);
     let peak = if peak == 0.0 { 1e-9 } else { peak };
@@ -366,77 +411,36 @@ pub fn analyze(y48: &[f32], duration: f64, name: &str) -> Result<Analysis, Error
     let rms = if rms == 0.0 { 1e-9 } else { rms };
     let y22: Vec<f64> = resample(y48, 48_000, 22_050)?.iter().map(|&v| v as f64).collect();
     let mags = stft_mag(&y22);
-    let brightness = spectral_centroid(&mags);
     let env = onset_strength(&mags);
     let onsets = count_onsets(&env);
 
-    let mut pitch_hz = None;
-    let seg = &y22[..y22.len().min(22_050)];
-    if seg.len() >= 4096 && spectral_flatness(&stft_mag(seg)) < 0.05 {
-        let f0: Vec<f64> = yin(seg).into_iter().filter(|v| v.is_finite()).collect();
-        if !f0.is_empty() {
-            let mut sorted = f0.clone();
-            sorted.sort_by(f64::total_cmp);
-            let k = sorted.len();
-            let p = if k % 2 == 1 { sorted[k / 2] } else { (sorted[k / 2 - 1] + sorted[k / 2]) / 2.0 };
-            let midi: Vec<f64> = f0.iter().map(|&f| hz_to_midi(f)).collect();
-            let mm = mean(&midi);
-            let spread = (midi.iter().map(|v| (v - mm).powi(2)).sum::<f64>() / midi.len() as f64).sqrt();
-            if p > 32.0 && p < 1900.0 && spread < 1.0 {
-                pitch_hz = Some(p);
-            }
-        }
-    }
-
-    let (mut tempo_out, mut is_loop) = (None, false);
-    let nb = name_bpm(name);
-    if duration >= 1.5 && onsets >= 4 && env.iter().any(|&v| v != 0.0) {
-        let t = tempo(&env);
-        let b = beats(&env, t);
-        let pulse = if b.len() >= 4 { mean(&b.iter().map(|&i| env[i]).collect::<Vec<_>>()) / (mean(&env) + 1e-9) } else { 0.0 };
-        // A loop is cut to a whole number of beats, so its length implies a tempo. Accept it
-        // only when that agrees with the detected beat.
-        if pulse > 2.0 && t > 0.0 {
-            'k: for k in [1.0, 2.0, 0.5] {
-                let cands: Vec<f64> = [4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0, 64.0]
-                    .iter()
-                    .map(|n| n * 60.0 / duration)
-                    .filter(|&c| (60.0..=200.0).contains(&c) && (c - t * k).abs() / c < 0.04)
-                    .collect();
-                if let Some(best) = cands.iter().cloned().min_by(|a, b| (a - t * k).abs().total_cmp(&(b - t * k).abs())) {
-                    tempo_out = Some((best * 100.0).round() / 100.0);
-                    is_loop = true;
-                    break 'k;
-                }
-            }
-        }
-    }
-    if let Some(b) = nb {
-        tempo_out = Some(b);
-        is_loop = true;
-    } else if duration >= 1.0 && name.to_lowercase().contains("loop") {
-        is_loop = true;
-    }
+    let rhythmic = duration >= 1.5 && onsets >= 4 && env.iter().any(|&v| v != 0.0);
+    let from_length = if rhythmic { loop_tempo(&env, duration) } else { None };
+    // A tempo in the name wins over the detected one, and the word "loop" is taken at its word.
+    let (tempo, is_loop) = match name_bpm(name) {
+        Some(named) => (Some(named), true),
+        None => (from_length, from_length.is_some() || (duration >= 1.0 && name.to_lowercase().contains("loop"))),
+    };
 
     Ok(Analysis {
         peak_db: 20.0 * peak.log10(),
         rms_db: 20.0 * rms.log10(),
         crest: peak / rms,
-        brightness,
-        pitch_hz,
-        tempo: tempo_out,
+        brightness: spectral_centroid(&mags),
+        pitch_hz: pitch_of(&y22),
+        tempo,
         onsets,
         is_loop,
     })
 }
 
-pub const PEAK_BINS: usize = 120;
+const PEAK_BINS: usize = 120;
 
 /// The waveform overview stored for each file: PEAK_BINS bytes, the loudest point of each slice
 /// of the whole file, scaled so the loudest slice is 255.
 pub fn peaks(d: &Decoded, y48: &[f32]) -> Vec<u8> {
     let vals: Vec<f64> = if d.duration() <= ANALYSIS_SECONDS {
-        // np.array_split: the first len % bins slices hold one extra sample.
+        // Slices as numpy's array_split cuts them: the first len % bins hold one extra sample.
         let n = y48.len();
         if n == 0 {
             return vec![0; PEAK_BINS];
@@ -464,4 +468,57 @@ pub fn peaks(d: &Decoded, y48: &[f32]) -> Vec<u8> {
     let top = vals.iter().cloned().fold(0.0, f64::max);
     let top = if top == 0.0 { 1.0 } else { top };
     vals.iter().map(|v| (v / top * 255.0) as u8).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn median_of_sorted_values() {
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[3.0]), Some(3.0));
+        assert_eq!(median(&[1.0, 2.0, 10.0]), Some(2.0));
+        assert_eq!(median(&[1.0, 2.0, 4.0, 10.0]), Some(3.0));
+    }
+
+    #[test]
+    fn tempo_in_a_name() {
+        assert_eq!(name_bpm("Break 120bpm.wav"), Some(120.0));
+        assert_eq!(name_bpm("break_95 BPM_dry.wav"), Some(95.0));
+        assert_eq!(name_bpm("kick.wav"), None);
+        assert_eq!(name_bpm("bpm.wav"), None);
+        // Four digits are not a tempo, and the search goes on after them.
+        assert_eq!(name_bpm("1200bpm then 90bpm"), Some(90.0));
+        // The first two or three digit number decides, even when it is out of range.
+        assert_eq!(name_bpm("300bpm or 100bpm"), None);
+        assert_eq!(name_bpm("7bpm 140bpm"), Some(140.0));
+    }
+
+    #[test]
+    fn peaks_of_a_short_file() {
+        let mut y = vec![0f32; 1210];
+        y[5] = -0.5;
+        y[1205] = 0.25;
+        let d = Decoded { channels: vec![y.clone()], sr: 48_000 };
+        let p = peaks(&d, &y);
+        assert_eq!(p.len(), PEAK_BINS);
+        assert_eq!((p[0], p[1], p[119]), (255, 0, 127));
+        assert_eq!(peaks(&Decoded { channels: vec![vec![]], sr: 48_000 }, &[]), vec![0; PEAK_BINS]);
+    }
+
+    #[test]
+    fn silence_and_a_tone() {
+        let silent = analyze(&vec![0f32; 48_000], 1.0, "silence.wav").unwrap();
+        assert_eq!((silent.onsets, silent.pitch_hz, silent.tempo, silent.is_loop), (0, None, None, false));
+        assert!(silent.peak_db.is_finite() && silent.rms_db.is_finite() && silent.crest.is_finite() && silent.brightness.is_finite());
+
+        let tone: Vec<f32> = (0..96_000).map(|i| (0.5 * (2.0 * std::f64::consts::PI * 220.0 * i as f64 / 48_000.0).sin()) as f32).collect();
+        let a = analyze(&tone, 2.0, "tone loop 100bpm.wav").unwrap();
+        assert!((a.peak_db + 6.02).abs() < 0.01 && (a.crest - 2f64.sqrt()).abs() < 0.01);
+        assert!((a.pitch_hz.unwrap() - 220.0).abs() < 1.0, "{:?}", a.pitch_hz);
+        assert_eq!((a.tempo, a.is_loop), (Some(100.0), true));
+        assert!(analyze(&tone, 2.0, "tone loop.wav").unwrap().is_loop);
+        assert!(!analyze(&tone, 2.0, "tone.wav").unwrap().is_loop);
+    }
 }
